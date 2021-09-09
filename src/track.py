@@ -180,7 +180,7 @@ if __name__ == '__main__':
                       TUD-Campus
                       TUD-Stadtmitte'''
         #seqs_str = '''TUD-Campus'''
-        data_root = os.path.join(opt.data_dir, 'MOT15/images/train')
+        data_root = os.path.join(opt.data_dir, 'MOT15/train')
     else:
         seqs_str = '''MOT16-02
                       MOT16-04
@@ -213,7 +213,7 @@ if __name__ == '__main__':
                       PETS09-S2L2
                       TUD-Crossing
                       Venice-1'''
-        data_root = os.path.join(opt.data_dir, 'MOT15/images/test')
+        data_root = os.path.join(opt.data_dir, 'MOT15/test')
     if opt.test_mot17:
         seqs_str = '''MOT17-01-SDP
                       MOT17-03-SDP
@@ -245,7 +245,7 @@ if __name__ == '__main__':
                       ADL-Rundle-8
                       ETH-Pedcross2
                       TUD-Stadtmitte'''
-        data_root = os.path.join(opt.data_dir, 'MOT15/images/train')
+        data_root = os.path.join(opt.data_dir, 'MOT15/train')
     if opt.val_mot20:
         seqs_str = '''MOT20-01
                       MOT20-02
