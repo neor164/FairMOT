@@ -74,6 +74,8 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
     timer = Timer()
     results = []
     frame_id = 0
+    print(f'III) found GPU: {torch.cuda.is_available()}')
+
     #for path, img, img0 in dataloader:
     for i, (path, img, img0) in enumerate(dataloader):
         #if i % 8 != 0:
@@ -119,6 +121,8 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
 
 def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), exp_name='demo',
          save_images=False, save_videos=False, show_image=True):
+    print(f'III) found GPU: {torch.cuda.is_available()}')
+
     logger.setLevel(logging.INFO)
     result_root = os.path.join(data_root, '..', 'results', exp_name)
     mkdir_if_missing(result_root)
@@ -169,8 +173,10 @@ def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), 
 
 
 if __name__ == '__main__':
+    print(f'I) found GPU: {torch.cuda.is_available()}')
     os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     opt = opts().init()
+    print(f'II) found GPU: {torch.cuda.is_available()}')
 
     if not opt.val_mot16:
         seqs_str = '''KITTI-13
