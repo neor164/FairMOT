@@ -21,6 +21,7 @@ import datasets.dataset.jde as datasets
 from mot_postgres.database_creator import dbc
 from tracking_utils.utils import mkdir_if_missing
 from opts import opts
+from typing import List
 
 
 def write_results(filename, results, data_type):
@@ -117,6 +118,10 @@ def eval_seq(opt, dataloader, data_type, result_filename, data_dict,  save_dir=N
                 save_dir, '{:05d}.jpg'.format(frame_id)), online_im)
         frame_id += 1
     # save results
+        if len(tracker.bulk_upsert_detections):
+            dbc.upsert_bulk_detections(tracker.bulk_upsert_detections)
+            tracker.bulk_upsert_detections = []
+
     write_results(result_filename, results, data_type)
     #write_results_score(result_filename, results, data_type)
     return frame_id, timer.average_time, timer.calls
@@ -160,6 +165,7 @@ def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), 
             cmd_str = 'ffmpeg -f image2 -i {}/%05d.jpg -c:v copy {}'.format(
                 output_dir, output_video_path)
             os.system(cmd_str)
+
     timer_avgs = np.asarray(timer_avgs)
     timer_calls = np.asarray(timer_calls)
     all_time = np.dot(timer_avgs, timer_calls)
