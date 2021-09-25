@@ -125,7 +125,9 @@ def eval_seq(opt, dataloader, data_type, result_filename, data_dict,  save_dir=N
     if len(tracker.bulk_upsert_kalman_prediction):
         dbc.upsert_bulk_kalman(tracker.bulk_upsert_kalman_prediction)
         tracker.bulk_upsert_detections = []
-
+    if len(tracker.bulk_upsert_trackers):
+        dbc.upsert_bulk_tracker(tracker.bulk_upsert_trackers)
+        tracker.bulk_upsert_trackers = []
     write_results(result_filename, results, data_type)
     #write_results_score(result_filename, results, data_type)
     return frame_id, timer.average_time, timer.calls
