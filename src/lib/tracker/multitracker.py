@@ -69,22 +69,25 @@ class STrack(BaseTrack):
             for i, st in enumerate(stracks):
                 if st.state != TrackState.Tracked:
                     multi_mean[i][7] = 0
-            multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(
-                multi_mean, multi_covariance)
-            for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
-                stracks[i].mean = mean
-                stracks[i].covariance = cov
-                row_dict = {
+                else:
+                    row_dict = {
                     "run_id": data_dict['run_id'],
-                    "tracker_id": i,
+                    "tracker_id": st.track_id,
                     "frame_id": st.frame_id,
                     "scenario_id": data_dict['scenario_id'],
                     "kalman_min_x": st.tlwh[0] - st.tlwh[2]/2,
                     "kalman_min_y": st.tlwh[1] - st.tlwh[3]/2,
                     "kalman_width": st.tlwh[2],
                     "kalman_height": st.tlwh[3],
-                }
-                bulk_kalman_upsert.append(row_dict)
+                    }
+                    bulk_kalman_upsert.append(row_dict)
+            multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(
+                multi_mean, multi_covariance)
+            for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
+                stracks[i].mean = mean
+                stracks[i].covariance = cov
+        
+                
 
     def activate(self, kalman_filter, frame_id):
         """Start a new tracklet"""
@@ -199,6 +202,7 @@ class JDETracker(object):
         self.model = load_model(self.model, opt.load_model)
         self.bulk_upsert_detections: List[dict] = []
         self.bulk_upsert_kalman_prediction: List[dict] = []
+        self.bulk_upsert_trackers: List[dict] = []
         self.bulk_size: int = 10e4
         self.model = self.model.to(opt.device)
         self.model.eval()
@@ -343,10 +347,12 @@ class JDETracker(object):
             self.kalman_filter, dists, strack_pool, detections)
         matches, u_track, u_detection = matching.linear_assignment(
             dists, thresh=0.4)
-
+        matches_dict:Dict[int, int] = {}
         for itracked, idet in matches:
             track = strack_pool[itracked]
             det = detections[idet]
+            matches_dict[track.track_id] = idet
+
             if track.state == TrackState.Tracked:
                 track.update(detections[idet], self.frame_id)
                 activated_starcks.append(track)
@@ -365,6 +371,7 @@ class JDETracker(object):
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
             det = detections[idet]
+            matches_dict[track.track_id] = idet
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id)
                 activated_starcks.append(track)
@@ -386,6 +393,8 @@ class JDETracker(object):
         for itracked, idet in matches:
             unconfirmed[itracked].update(detections[idet], self.frame_id)
             activated_starcks.append(unconfirmed[itracked])
+            matches_dict[unconfirmed[itracked].track_id] = idet
+
         for it in u_unconfirmed:
             track = unconfirmed[it]
             track.mark_removed()
@@ -397,6 +406,7 @@ class JDETracker(object):
             if track.score < self.det_thresh:
                 continue
             track.activate(self.kalman_filter, self.frame_id)
+            matches_dict[track.track_id] = inew
             activated_starcks.append(track)
         """ Step 5: Update state"""
         for track in self.lost_stracks:
@@ -408,6 +418,9 @@ class JDETracker(object):
 
         self.tracked_stracks = [
             t for t in self.tracked_stracks if t.state == TrackState.Tracked]
+
+
+            
         self.tracked_stracks = joint_stracks(
             self.tracked_stracks, activated_starcks)
         self.tracked_stracks = joint_stracks(
@@ -421,8 +434,30 @@ class JDETracker(object):
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(
             self.tracked_stracks, self.lost_stracks)
         # get scores of lost tracks
-        output_stracks = [
-            track for track in self.tracked_stracks if track.is_activated]
+        # output_stracks = [
+        #     track for track in self.tracked_stracks if track.is_activated]
+        output_stracks = []
+        for track in self.tracked_stracks:
+            if track.is_activated:
+                output_stracks.append(track)
+                row_dict = {
+                    "run_id": self.run_id,
+                    "tracker_id": int(track.track_id),
+                    "frame_id": self.frame_id,
+                    "scenario_id": self.scenario_id,
+                    "target_index": int(matches_dict[track.track_id]),
+                    "min_x": float(track.tlwh[0] - track.tlwh[2]/2),
+                    "min_y": float(track.tlwh[1] - track.tlwh[3]/2),
+                    "width": float(track.tlwh[2]),
+                    "height": float(track.tlwh[3]),
+                    }
+                self.bulk_upsert_trackers.append(row_dict)
+
+        
+        if len(self.bulk_upsert_trackers) > self.bulk_size:
+            dbc.upsert_bulk_tracker(self.bulk_upsert_trackers)
+            self.bulk_upsert_trackers: List[dict] = []
+
 
         logger.debug('===========Frame {}=========='.format(self.frame_id))
         logger.debug('Activated: {}'.format(
