@@ -18,7 +18,7 @@ from tracking_utils.log import logger
 from tracking_utils.timer import Timer
 from tracking_utils.evaluation import Evaluator
 import datasets.dataset.jde as datasets
-
+from mot_postgres.database_creator import dbc
 from tracking_utils.utils import mkdir_if_missing
 from opts import opts
 
@@ -40,7 +40,8 @@ def write_results(filename, results, data_type):
                     continue
                 x1, y1, w, h = tlwh
                 x2, y2 = x1 + w, y1 + h
-                line = save_format.format(frame=frame_id, id=track_id, x1=x1, y1=y1, x2=x2, y2=y2, w=w, h=h)
+                line = save_format.format(
+                    frame=frame_id, id=track_id, x1=x1, y1=y1, x2=x2, y2=y2, w=w, h=h)
                 f.write(line)
     logger.info('save results to {}'.format(filename))
 
@@ -62,26 +63,27 @@ def write_results_score(filename, results, data_type):
                     continue
                 x1, y1, w, h = tlwh
                 x2, y2 = x1 + w, y1 + h
-                line = save_format.format(frame=frame_id, id=track_id, x1=x1, y1=y1, x2=x2, y2=y2, w=w, h=h, s=score)
+                line = save_format.format(
+                    frame=frame_id, id=track_id, x1=x1, y1=y1, x2=x2, y2=y2, w=w, h=h, s=score)
                 f.write(line)
     logger.info('save results to {}'.format(filename))
 
 
-def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_image=True, frame_rate=30, use_cuda=True):
+def eval_seq(opt, dataloader, data_type, result_filename, data_dict,  save_dir=None, show_image=True, frame_rate=30, use_cuda=True):
     if save_dir:
         mkdir_if_missing(save_dir)
-    tracker = JDETracker(opt, frame_rate=frame_rate)
+    tracker = JDETracker(opt, data_dict,  frame_rate=frame_rate)
     timer = Timer()
     results = []
     frame_id = 0
-    print(f'III) found GPU: {torch.cuda.is_available()}')
-
-    #for path, img, img0 in dataloader:
+    # for path, img, img0 in dataloader:
     for i, (path, img, img0) in enumerate(dataloader):
-        #if i % 8 != 0:
-            #continue
+        # if i % 8 != 0:
+        # continue
+
         if frame_id % 20 == 0:
-            logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
+            logger.info('Processing frame {} ({:.2f} fps)'.format(
+                frame_id, 1. / max(1e-5, timer.average_time)))
 
         # run tracking
         timer.tic()
@@ -100,7 +102,7 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
             if tlwh[2] * tlwh[3] > opt.min_box_area and not vertical:
                 online_tlwhs.append(tlwh)
                 online_ids.append(tid)
-                #online_scores.append(t.score)
+                # online_scores.append(t.score)
         timer.toc()
         # save results
         results.append((frame_id + 1, online_tlwhs, online_ids))
@@ -111,7 +113,8 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
         if show_image:
             cv2.imshow('online_im', online_im)
         if save_dir is not None:
-            cv2.imwrite(os.path.join(save_dir, '{:05d}.jpg'.format(frame_id)), online_im)
+            cv2.imwrite(os.path.join(
+                save_dir, '{:05d}.jpg'.format(frame_id)), online_im)
         frame_id += 1
     # save results
     write_results(result_filename, results, data_type)
@@ -121,25 +124,28 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
 
 def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), exp_name='demo',
          save_images=False, save_videos=False, show_image=True):
-    print(f'III) found GPU: {torch.cuda.is_available()}')
-
     logger.setLevel(logging.INFO)
     result_root = os.path.join(data_root, '..', 'results', exp_name)
     mkdir_if_missing(result_root)
     data_type = 'mot'
 
     # run tracking
+    data_dict = {"run_id": 1}
     accs = []
     n_frame = 0
     timer_avgs, timer_calls = [], []
     for seq in seqs:
-        output_dir = os.path.join(data_root, '..', 'outputs', exp_name, seq) if save_images or save_videos else None
+        data_dict['scenario_id'] = dbc.get_scenario_props_by_name(seq).id
+        output_dir = os.path.join(
+            data_root, '..', 'outputs', exp_name, seq) if save_images or save_videos else None
         logger.info('start seq: {}'.format(seq))
-        dataloader = datasets.LoadImages(osp.join(data_root, seq, 'img1'), opt.img_size)
+        dataloader = datasets.LoadImages(
+            osp.join(data_root, seq, 'img1'), opt.img_size)
         result_filename = os.path.join(result_root, '{}.txt'.format(seq))
         meta_info = open(os.path.join(data_root, seq, 'seqinfo.ini')).read()
-        frame_rate = int(meta_info[meta_info.find('frameRate') + 10:meta_info.find('\nseqLength')])
-        nf, ta, tc = eval_seq(opt, dataloader, data_type, result_filename,
+        frame_rate = int(meta_info[meta_info.find(
+            'frameRate') + 10:meta_info.find('\nseqLength')])
+        nf, ta, tc = eval_seq(opt, dataloader, data_type, result_filename, data_dict,
                               save_dir=output_dir, show_image=show_image, frame_rate=frame_rate)
         n_frame += nf
         timer_avgs.append(ta)
@@ -151,13 +157,15 @@ def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), 
         accs.append(evaluator.eval_file(result_filename))
         if save_videos:
             output_video_path = osp.join(output_dir, '{}.mp4'.format(seq))
-            cmd_str = 'ffmpeg -f image2 -i {}/%05d.jpg -c:v copy {}'.format(output_dir, output_video_path)
+            cmd_str = 'ffmpeg -f image2 -i {}/%05d.jpg -c:v copy {}'.format(
+                output_dir, output_video_path)
             os.system(cmd_str)
     timer_avgs = np.asarray(timer_avgs)
     timer_calls = np.asarray(timer_calls)
     all_time = np.dot(timer_avgs, timer_calls)
     avg_time = all_time / np.sum(timer_calls)
-    logger.info('Time elapsed: {:.2f} seconds, FPS: {:.2f}'.format(all_time, 1.0 / avg_time))
+    logger.info('Time elapsed: {:.2f} seconds, FPS: {:.2f}'.format(
+        all_time, 1.0 / avg_time))
 
     # get summary
     metrics = mm.metrics.motchallenge_metrics
@@ -169,15 +177,15 @@ def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), 
         namemap=mm.io.motchallenge_metric_names
     )
     print(strsummary)
-    Evaluator.save_summary(summary, os.path.join(result_root, 'summary_{}.xlsx'.format(exp_name)))
+    Evaluator.save_summary(summary, os.path.join(
+        result_root, 'summary_{}.xlsx'.format(exp_name)))
 
 
 if __name__ == '__main__':
-    print(f'I) found GPU: {torch.cuda.is_available()}')
+    print(torch.cuda.is_available())
     os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     opt = opts().init()
-    print(f'II) found GPU: {torch.cuda.is_available()}')
-
+    print(torch.cuda.is_available())
     if not opt.val_mot16:
         seqs_str = '''KITTI-13
                       KITTI-17
@@ -195,6 +203,7 @@ if __name__ == '__main__':
                       MOT16-10
                       MOT16-11
                       MOT16-13'''
+
         data_root = os.path.join(opt.data_dir, 'MOT16/train')
     if opt.test_mot16:
         seqs_str = '''MOT16-01
@@ -204,6 +213,7 @@ if __name__ == '__main__':
                       MOT16-08
                       MOT16-12
                       MOT16-14'''
+
         #seqs_str = '''MOT16-01 MOT16-07 MOT16-12 MOT16-14'''
         #seqs_str = '''MOT16-06 MOT16-08'''
         data_root = os.path.join(opt.data_dir, 'MOT16/test')
@@ -228,7 +238,7 @@ if __name__ == '__main__':
                       MOT17-08-SDP
                       MOT17-12-SDP
                       MOT17-14-SDP'''
-        data_root = os.path.join(opt.data_dir, 'MOT17/images/test')
+        data_root = os.path.join(opt.data_dir, 'MOT17/test')
     if opt.val_mot17:
         seqs_str = '''MOT17-02-SDP
                       MOT17-04-SDP
@@ -237,7 +247,7 @@ if __name__ == '__main__':
                       MOT17-10-SDP
                       MOT17-11-SDP
                       MOT17-13-SDP'''
-        data_root = os.path.join(opt.data_dir, 'MOT17/images/train')
+        data_root = os.path.join(opt.data_dir, 'MOT17/train')
     if opt.val_mot15:
         seqs_str = '''Venice-2
                       KITTI-13
@@ -258,16 +268,15 @@ if __name__ == '__main__':
                       MOT20-03
                       MOT20-05
                       '''
-        data_root = os.path.join(opt.data_dir, 'MOT20/images/train')
+        data_root = os.path.join(opt.data_dir, 'MOT20/train')
     if opt.test_mot20:
         seqs_str = '''MOT20-04
                       MOT20-06
                       MOT20-07
                       MOT20-08
                       '''
-        data_root = os.path.join(opt.data_dir, 'MOT20/images/test')
+        data_root = os.path.join(opt.data_dir, 'MOT20/test')
     seqs = [seq.strip() for seq in seqs_str.split()]
-
     main(opt,
          data_root=data_root,
          seqs=seqs,
