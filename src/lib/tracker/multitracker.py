@@ -19,9 +19,9 @@ from utils.image import get_affine_transform
 from utils.post_process import ctdet_post_process
 from tracker import matching
 from mot_postgres.tables.detector_tables import DetectionsProps
-from mot_postgres.database_creator import dbc
+from mot_postgres.mot_postgres import dbc
 from .basetrack import BaseTrack, TrackState
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 
 class STrack(BaseTrack):
@@ -34,7 +34,8 @@ class STrack(BaseTrack):
         self.kalman_filter = None
         self.mean, self.covariance = None, None
         self.is_activated = False
-
+        self.bulk_kalman_upsert: List[dict] = []
+        self.max_bulk_size = 10000
         self.score = score
         self.tracklet_len = 0
         self.smooth_feat = None
@@ -61,7 +62,7 @@ class STrack(BaseTrack):
             mean_state, self.covariance)
 
     @staticmethod
-    def multi_predict(stracks):
+    def multi_predict(stracks, bulk_kalman_upsert: List[dict], data_dict: Dict[str, float]):
         if len(stracks) > 0:
             multi_mean = np.asarray([st.mean.copy() for st in stracks])
             multi_covariance = np.asarray([st.covariance for st in stracks])
@@ -73,6 +74,17 @@ class STrack(BaseTrack):
             for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
                 stracks[i].mean = mean
                 stracks[i].covariance = cov
+                row_dict = {
+                    "run_id": data_dict['run_id'],
+                    "tracker_id": i,
+                    "frame_id": st.frame_id,
+                    "scenario_id": data_dict['scenario_id'],
+                    "kalman_min_x": st.tlwh[0] - st.tlwh[2]/2,
+                    "kalman_min_y": st.tlwh[1] - st.tlwh[3]/2,
+                    "kalman_width": st.tlwh[2],
+                    "kalman_height": st.tlwh[3],
+                }
+                bulk_kalman_upsert.append(row_dict)
 
     def activate(self, kalman_filter, frame_id):
         """Start a new tracklet"""
@@ -180,11 +192,13 @@ class JDETracker(object):
             opt.device = torch.device('cuda')
         else:
             opt.device = torch.device('cpu')
+        self.data_dict = data_dict
         print('Creating model...')
         self.model = create_model(opt.arch, opt.heads, opt.head_conv)
         print(torch.cuda.is_available())
         self.model = load_model(self.model, opt.load_model)
         self.bulk_upsert_detections: List[dict] = []
+        self.bulk_upsert_kalman_prediction: List[dict] = []
         self.bulk_size: int = 10e4
         self.model = self.model.to(opt.device)
         self.model.eval()
@@ -286,7 +300,7 @@ class JDETracker(object):
 
         if len(self.bulk_upsert_detections) > self.bulk_size:
             dbc.upsert_bulk_detections(self.bulk_upsert_detections)
-            self.bulk_upsert_detections:List[dict] = []
+            self.bulk_upsert_detections: List[dict] = []
         #     bbox = dets[i][0:4]
 
         #     cv2.rectangle(img0, (bbox[0], bbox[1]),
@@ -317,7 +331,12 @@ class JDETracker(object):
         # Predict the current location with KF
         # for strack in strack_pool:
         # strack.predict()
-        STrack.multi_predict(strack_pool)
+        STrack.multi_predict(
+            strack_pool, self.bulk_upsert_kalman_prediction, self.data_dict)
+        if len(self.bulk_upsert_kalman_prediction) > self.bulk_size:
+            dbc.upsert_bulk_kalman(self.bulk_upsert_kalman_prediction)
+            self.bulk_upsert_kalman_prediction: List[dict] = []
+
         dists = matching.embedding_distance(strack_pool, detections)
         #dists = matching.iou_distance(strack_pool, detections)
         dists = matching.fuse_motion(
