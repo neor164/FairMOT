@@ -18,7 +18,7 @@ from tracking_utils.log import logger
 from tracking_utils.timer import Timer
 from tracking_utils.evaluation import Evaluator
 import datasets.dataset.jde as datasets
-from mot_postgres.database_creator import dbc
+from mot_postgres.mot_postgres import dbc
 from tracking_utils.utils import mkdir_if_missing
 from opts import opts
 from typing import List
@@ -118,9 +118,13 @@ def eval_seq(opt, dataloader, data_type, result_filename, data_dict,  save_dir=N
                 save_dir, '{:05d}.jpg'.format(frame_id)), online_im)
         frame_id += 1
     # save results
-        if len(tracker.bulk_upsert_detections):
-            dbc.upsert_bulk_detections(tracker.bulk_upsert_detections)
-            tracker.bulk_upsert_detections = []
+    if len(tracker.bulk_upsert_detections):
+        dbc.upsert_bulk_detections(tracker.bulk_upsert_detections)
+        tracker.bulk_upsert_detections = []
+
+    if len(tracker.bulk_upsert_kalman_prediction):
+        dbc.upsert_bulk_kalman(tracker.bulk_upsert_kalman_prediction)
+        tracker.bulk_upsert_detections = []
 
     write_results(result_filename, results, data_type)
     #write_results_score(result_filename, results, data_type)
