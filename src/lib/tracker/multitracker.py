@@ -446,8 +446,8 @@ class JDETracker(object):
                     "frame_id": self.frame_id,
                     "scenario_id": self.scenario_id,
                     "target_index": int(matches_dict[track.track_id]),
-                    "min_x": float(track.tlwh[0] - track.tlwh[2]/2),
-                    "min_y": float(track.tlwh[1] - track.tlwh[3]/2),
+                    "min_x": float(track.tlwh[0]),
+                    "min_y": float(track.tlwh[1]),
                     "width": float(track.tlwh[2]),
                     "height": float(track.tlwh[3]),
                     }
