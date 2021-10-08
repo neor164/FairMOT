@@ -62,30 +62,30 @@ class STrack(BaseTrack):
             mean_state, self.covariance)
 
     @staticmethod
-    def multi_predict(stracks, bulk_kalman_upsert: List[dict], data_dict: Dict[str, float]):
+    def multi_predict(stracks, bulk_kalman_upsert: List[dict], data_dict: Dict[str, float],frame_id):
         if len(stracks) > 0:
             multi_mean = np.asarray([st.mean.copy() for st in stracks])
             multi_covariance = np.asarray([st.covariance for st in stracks])
             for i, st in enumerate(stracks):
                 if st.state != TrackState.Tracked:
                     multi_mean[i][7] = 0
-                else:
-                    row_dict = {
-                    "run_id": data_dict['run_id'],
-                    "tracker_id": st.track_id,
-                    "frame_id": st.frame_id,
-                    "scenario_id": data_dict['scenario_id'],
-                    "kalman_min_x": st.tlwh[0] - st.tlwh[2]/2,
-                    "kalman_min_y": st.tlwh[1] - st.tlwh[3]/2,
-                    "kalman_width": st.tlwh[2],
-                    "kalman_height": st.tlwh[3],
-                    }
-                    bulk_kalman_upsert.append(row_dict)
             multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(
                 multi_mean, multi_covariance)
             for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
                 stracks[i].mean = mean
                 stracks[i].covariance = cov
+                row_dict = {
+                    "run_id": data_dict['run_id'],
+                    "tracker_id": stracks[i].track_id,
+                    "frame_id": frame_id,
+                    "scenario_id": data_dict['scenario_id'],
+                    "kalman_min_x": stracks[i].tlwh[0],
+                    "kalman_min_y": stracks[i].tlwh[1],
+                    "kalman_width": stracks[i].tlwh[2],
+                    "kalman_height": stracks[i].tlwh[3],
+                    "track_status": stracks[i].state},
+                bulk_kalman_upsert.append(row_dict)
+
         
                 
 
@@ -335,8 +335,9 @@ class JDETracker(object):
         # Predict the current location with KF
         # for strack in strack_pool:
         # strack.predict()
+
         STrack.multi_predict(
-            strack_pool, self.bulk_upsert_kalman_prediction, self.data_dict)
+            strack_pool, self.bulk_upsert_kalman_prediction, self.data_dict, self.frame_id)
         if len(self.bulk_upsert_kalman_prediction) > self.bulk_size:
             dbc.upsert_bulk_kalman(self.bulk_upsert_kalman_prediction)
             self.bulk_upsert_kalman_prediction: List[dict] = []
