@@ -288,6 +288,9 @@ if __name__ == '__main__':
                       MOT20-08
                       '''
         data_root = os.path.join(opt.data_dir, 'MOT20/test')
+    if opt.custom:
+        seqs_str = '''MOT20-03
+                      '''
     seqs = [seq.strip() for seq in seqs_str.split()]
     main(opt,
          data_root=data_root,
