@@ -291,6 +291,7 @@ if __name__ == '__main__':
     if opt.custom:
         seqs_str = '''MOT20-03
                       '''
+        data_root = os.path.join(opt.data_dir, 'MOT20/train')
     seqs = [seq.strip() for seq in seqs_str.split()]
     main(opt,
          data_root=data_root,
