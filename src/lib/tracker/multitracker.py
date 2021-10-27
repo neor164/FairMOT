@@ -19,7 +19,8 @@ from utils.image import get_affine_transform
 from utils.post_process import ctdet_post_process
 from tracker import matching
 from mot_postgres.tables.detector_tables import DetectionsProps
-from mot_postgres.mot_postgres import dbc
+from mot_postgres.mot_postgres import 
+
 from .basetrack import BaseTrack, TrackState
 from typing import Optional, List, Dict
 
@@ -302,9 +303,9 @@ class JDETracker(object):
             }
             self.bulk_upsert_detections.append(row_dict)
 
-        if len(self.bulk_upsert_detections) > self.bulk_size:
-            dbc.upsert_bulk_detections(self.bulk_upsert_detections)
-            self.bulk_upsert_detections: List[dict] = []
+#         if len(self.bulk_upsert_detections) > self.bulk_size:
+#             dbc.upsert_bulk_detections(self.bulk_upsert_detections)
+#             self.bulk_upsert_detections: List[dict] = []
         #     bbox = dets[i][0:4]
 
         #     cv2.rectangle(img0, (bbox[0], bbox[1]),
@@ -338,9 +339,9 @@ class JDETracker(object):
 
         STrack.multi_predict(
             strack_pool, self.bulk_upsert_kalman_prediction, self.data_dict, self.frame_id)
-        if len(self.bulk_upsert_kalman_prediction) > self.bulk_size:
-            dbc.upsert_bulk_kalman(self.bulk_upsert_kalman_prediction)
-            self.bulk_upsert_kalman_prediction: List[dict] = []
+#         if len(self.bulk_upsert_kalman_prediction) > self.bulk_size:
+#             dbc.upsert_bulk_kalman(self.bulk_upsert_kalman_prediction)
+#             self.bulk_upsert_kalman_prediction: List[dict] = []
 
         dists = matching.embedding_distance(strack_pool, detections)
         #dists = matching.iou_distance(strack_pool, detections)
@@ -455,9 +456,9 @@ class JDETracker(object):
                 self.bulk_upsert_trackers.append(row_dict)
 
         
-        if len(self.bulk_upsert_trackers) > self.bulk_size:
-            dbc.upsert_bulk_tracker(self.bulk_upsert_trackers)
-            self.bulk_upsert_trackers: List[dict] = []
+#         if len(self.bulk_upsert_trackers) > self.bulk_size:
+#             dbc.upsert_bulk_tracker(self.bulk_upsert_trackers)
+#             self.bulk_upsert_trackers: List[dict] = []
 
 
         logger.debug('===========Frame {}=========='.format(self.frame_id))
