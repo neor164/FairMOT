@@ -41,8 +41,14 @@ def write_results(filename, results, data_type):
                     continue
                 x1, y1, w, h = tlwh
                 x2, y2 = x1 + w, y1 + h
-                line = save_format.format(
-                    frame=frame_id, id=track_id, x1=x1, y1=y1, x2=x2, y2=y2, w=w, h=h)
+                line = save_format.format(frame=frame_id,
+                                          id=track_id,
+                                          x1=x1,
+                                          y1=y1,
+                                          x2=x2,
+                                          y2=y2,
+                                          w=w,
+                                          h=h)
                 f.write(line)
     logger.info('save results to {}'.format(filename))
 
@@ -64,16 +70,32 @@ def write_results_score(filename, results, data_type):
                     continue
                 x1, y1, w, h = tlwh
                 x2, y2 = x1 + w, y1 + h
-                line = save_format.format(
-                    frame=frame_id, id=track_id, x1=x1, y1=y1, x2=x2, y2=y2, w=w, h=h, s=score)
+                line = save_format.format(frame=frame_id,
+                                          id=track_id,
+                                          x1=x1,
+                                          y1=y1,
+                                          x2=x2,
+                                          y2=y2,
+                                          w=w,
+                                          h=h,
+                                          s=score)
                 f.write(line)
     logger.info('save results to {}'.format(filename))
 
 
-def eval_seq(opt, dataloader, data_type, result_filename, data_dict,  save_dir=None, show_image=True, frame_rate=30, use_cuda=True):
+def eval_seq(opt,
+             dataloader,
+             data_type,
+             result_filename,
+             data_dict,
+             save_dir=None,
+             show_image=True,
+             frame_rate=30,
+             use_cuda=True):
     if save_dir:
         mkdir_if_missing(save_dir)
-    tracker = JDETracker(opt, data_dict,  frame_rate=frame_rate)
+    data_dict['update_database'] = opt.update_database
+    tracker: JDETracker = JDETracker(opt, data_dict, frame_rate=frame_rate)
     timer = Timer()
     results = []
     frame_id = 0
@@ -109,32 +131,45 @@ def eval_seq(opt, dataloader, data_type, result_filename, data_dict,  save_dir=N
         results.append((frame_id + 1, online_tlwhs, online_ids))
         #results.append((frame_id + 1, online_tlwhs, online_ids, online_scores))
         if show_image or save_dir is not None:
-            online_im = vis.plot_tracking(img0, online_tlwhs, online_ids, frame_id=frame_id,
+            online_im = vis.plot_tracking(img0,
+                                          online_tlwhs,
+                                          online_ids,
+                                          frame_id=frame_id,
                                           fps=1. / timer.average_time)
         if show_image:
             cv2.imshow('online_im', online_im)
         if save_dir is not None:
-            cv2.imwrite(os.path.join(
-                save_dir, '{:05d}.jpg'.format(frame_id)), online_im)
+            cv2.imwrite(os.path.join(save_dir, '{:05d}.jpg'.format(frame_id)),
+                        online_im)
         frame_id += 1
     # save results
-#     if len(tracker.bulk_upsert_detections):
-#         dbc.upsert_bulk_detections(tracker.bulk_upsert_detections)
-#         tracker.bulk_upsert_detections = []
+    if opt.update_database:
+        if len(tracker.bulk_upsert_distances):
+            dbc.upsert_bulk_distances_data(tracker.bulk_upsert_distances)
+            tracker.bulk_upsert_distances = []
+        if len(tracker.bulk_upsert_detections):
+            dbc.upsert_bulk_detections(tracker.bulk_upsert_detections)
+            tracker.bulk_upsert_detections = []
 
-#     if len(tracker.bulk_upsert_kalman_prediction):
-#         dbc.upsert_bulk_kalman(tracker.bulk_upsert_kalman_prediction)
-#         tracker.bulk_upsert_detections = []
-#     if len(tracker.bulk_upsert_trackers):
-#         dbc.upsert_bulk_tracker(tracker.bulk_upsert_trackers)
-#         tracker.bulk_upsert_trackers = []
+        if len(tracker.bulk_upsert_kalman_prediction):
+            dbc.upsert_bulk_kalman(tracker.bulk_upsert_kalman_prediction)
+            tracker.bulk_upsert_detections = []
+        if len(tracker.bulk_upsert_trackers):
+            dbc.upsert_bulk_tracker(tracker.bulk_upsert_trackers)
+            tracker.bulk_upsert_trackers = []
     write_results(result_filename, results, data_type)
     #write_results_score(result_filename, results, data_type)
     return frame_id, timer.average_time, timer.calls
 
 
-def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), exp_name='demo',
-         save_images=False, save_videos=False, show_image=True):
+def main(opt,
+         data_root='/data/MOT16/train',
+         det_root=None,
+         seqs=('MOT16-05', ),
+         exp_name='demo',
+         save_images=False,
+         save_videos=False,
+         show_image=True):
     logger.setLevel(logging.INFO)
     result_root = os.path.join(data_root, '..', 'results', exp_name)
     mkdir_if_missing(result_root)
@@ -146,18 +181,25 @@ def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), 
     n_frame = 0
     timer_avgs, timer_calls = [], []
     for seq in seqs:
+        print(seq)
         data_dict['scenario_id'] = dbc.get_scenario_props_by_name(seq).id
-        output_dir = os.path.join(
-            data_root, '..', 'outputs', exp_name, seq) if save_images or save_videos else None
+        output_dir = os.path.join(data_root, '..', 'outputs', exp_name,
+                                  seq) if save_images or save_videos else None
         logger.info('start seq: {}'.format(seq))
-        dataloader = datasets.LoadImages(
-            osp.join(data_root, seq, 'img1'), opt.img_size)
+        dataloader = datasets.LoadImages(osp.join(data_root, seq, 'img1'),
+                                         opt.img_size)
         result_filename = os.path.join(result_root, '{}.txt'.format(seq))
         meta_info = open(os.path.join(data_root, seq, 'seqinfo.ini')).read()
-        frame_rate = int(meta_info[meta_info.find(
-            'frameRate') + 10:meta_info.find('\nseqLength')])
-        nf, ta, tc = eval_seq(opt, dataloader, data_type, result_filename, data_dict,
-                              save_dir=output_dir, show_image=show_image, frame_rate=frame_rate)
+        frame_rate = int(meta_info[meta_info.find('frameRate') +
+                                   10:meta_info.find('\nseqLength')])
+        nf, ta, tc = eval_seq(opt,
+                              dataloader,
+                              data_type,
+                              result_filename,
+                              data_dict,
+                              save_dir=output_dir,
+                              show_image=show_image,
+                              frame_rate=frame_rate)
         n_frame += nf
         timer_avgs.append(ta)
         timer_calls.append(tc)
@@ -183,14 +225,12 @@ def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), 
     metrics = mm.metrics.motchallenge_metrics
     mh = mm.metrics.create()
     summary = Evaluator.get_summary(accs, seqs, metrics)
-    strsummary = mm.io.render_summary(
-        summary,
-        formatters=mh.formatters,
-        namemap=mm.io.motchallenge_metric_names
-    )
+    strsummary = mm.io.render_summary(summary,
+                                      formatters=mh.formatters,
+                                      namemap=mm.io.motchallenge_metric_names)
     print(strsummary)
-    Evaluator.save_summary(summary, os.path.join(
-        result_root, 'summary_{}.xlsx'.format(exp_name)))
+    Evaluator.save_summary(
+        summary, os.path.join(result_root, 'summary_{}.xlsx'.format(exp_name)))
 
 
 if __name__ == '__main__':
@@ -288,9 +328,9 @@ if __name__ == '__main__':
                       MOT20-08
                       '''
         data_root = os.path.join(opt.data_dir, 'MOT20/test')
+
     if opt.custom:
-        seqs_str = '''MOT20-03
-                      '''
+        seqs_str = '''MOT20-03'''
         data_root = os.path.join(opt.data_dir, 'MOT20/train')
     seqs = [seq.strip() for seq in seqs_str.split()]
     main(opt,
