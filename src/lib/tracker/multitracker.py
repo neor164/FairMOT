@@ -19,8 +19,7 @@ from utils.image import get_affine_transform
 from utils.post_process import ctdet_post_process
 from tracker import matching
 from mot_postgres.tables.detector_tables import DetectionsProps
-from mot_postgres.mot_postgres import 
-
+from mot_postgres.mot_postgres import dbc
 from .basetrack import BaseTrack, TrackState
 from typing import Optional, List, Dict
 
@@ -63,7 +62,8 @@ class STrack(BaseTrack):
             mean_state, self.covariance)
 
     @staticmethod
-    def multi_predict(stracks, bulk_kalman_upsert: List[dict], data_dict: Dict[str, float],frame_id):
+    def multi_predict(stracks, bulk_kalman_upsert: List[dict],
+                      data_dict: Dict[str, float], frame_id):
         if len(stracks) > 0:
             multi_mean = np.asarray([st.mean.copy() for st in stracks])
             multi_covariance = np.asarray([st.covariance for st in stracks])
@@ -75,6 +75,7 @@ class STrack(BaseTrack):
             for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
                 stracks[i].mean = mean
                 stracks[i].covariance = cov
+
                 row_dict = {
                     "run_id": data_dict['run_id'],
                     "tracker_id": stracks[i].track_id,
@@ -84,11 +85,9 @@ class STrack(BaseTrack):
                     "kalman_min_y": stracks[i].tlwh[1],
                     "kalman_width": stracks[i].tlwh[2],
                     "kalman_height": stracks[i].tlwh[3],
-                    "track_status": stracks[i].state},
+                    "track_status": stracks[i].state
+                }
                 bulk_kalman_upsert.append(row_dict)
-
-        
-                
 
     def activate(self, kalman_filter, frame_id):
         """Start a new tracklet"""
@@ -107,8 +106,8 @@ class STrack(BaseTrack):
 
     def re_activate(self, new_track, frame_id, new_id=False):
         self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_track.tlwh)
-        )
+            self.mean, self.covariance, self.tlwh_to_xyah(new_track.tlwh),
+            new_track.score)
 
         self.update_features(new_track.curr_feat)
         self.tracklet_len = 0
@@ -131,7 +130,8 @@ class STrack(BaseTrack):
 
         new_tlwh = new_track.tlwh
         self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_tlwh))
+            self.mean, self.covariance, self.tlwh_to_xyah(new_tlwh),
+            new_track.score)
         self.state = TrackState.Tracked
         self.is_activated = True
 
@@ -186,7 +186,8 @@ class STrack(BaseTrack):
         return ret
 
     def __repr__(self):
-        return 'OT_{}_({}-{})'.format(self.track_id, self.start_frame, self.end_frame)
+        return 'OT_{}_({}-{})'.format(self.track_id, self.start_frame,
+                                      self.end_frame)
 
 
 class JDETracker(object):
@@ -202,9 +203,10 @@ class JDETracker(object):
         print(torch.cuda.is_available())
         self.model = load_model(self.model, opt.load_model)
         self.bulk_upsert_detections: List[dict] = []
+        self.bulk_upsert_distances: List[dict] = []
         self.bulk_upsert_kalman_prediction: List[dict] = []
         self.bulk_upsert_trackers: List[dict] = []
-        self.bulk_size: int = 10e4
+        self.bulk_size: int = 10e3
         self.model = self.model.to(opt.device)
         self.model.eval()
         self.run_id = data_dict['run_id']
@@ -219,15 +221,14 @@ class JDETracker(object):
         self.max_per_image = opt.K
         self.mean = np.array(opt.mean, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array(opt.std, dtype=np.float32).reshape(1, 1, 3)
-
         self.kalman_filter = KalmanFilter()
 
     def post_process(self, dets, meta):
         dets = dets.detach().cpu().numpy()
         dets = dets.reshape(1, -1, dets.shape[2])
-        dets = ctdet_post_process(
-            dets.copy(), [meta['c']], [meta['s']],
-            meta['out_height'], meta['out_width'], self.opt.num_classes)
+        dets = ctdet_post_process(dets.copy(), [meta['c']], [meta['s']],
+                                  meta['out_height'], meta['out_width'],
+                                  self.opt.num_classes)
         for j in range(1, self.opt.num_classes + 1):
             dets[0][j] = np.array(dets[0][j], dtype=np.float32).reshape(-1, 5)
         return dets[0]
@@ -236,7 +237,8 @@ class JDETracker(object):
         results = {}
         for j in range(1, self.opt.num_classes + 1):
             results[j] = np.concatenate(
-                [detection[j] for detection in detections], axis=0).astype(np.float32)
+                [detection[j] for detection in detections],
+                axis=0).astype(np.float32)
 
         scores = np.hstack(
             [results[j][:, 4] for j in range(1, self.opt.num_classes + 1)])
@@ -261,10 +263,12 @@ class JDETracker(object):
         inp_width = im_blob.shape[3]
         c = np.array([width / 2., height / 2.], dtype=np.float32)
         s = max(float(inp_width) / float(inp_height) * height, width) * 1.0
-        meta = {'c': c, 's': s,
-                'out_height': inp_height // self.opt.down_ratio,
-                'out_width': inp_width // self.opt.down_ratio}
-
+        meta = {
+            'c': c,
+            's': s,
+            'out_height': inp_height // self.opt.down_ratio,
+            'out_width': inp_width // self.opt.down_ratio
+        }
         ''' Step 1: Network forward, get detections & embeddings'''
         with torch.no_grad():
             output = self.model(im_blob)[-1]
@@ -274,8 +278,11 @@ class JDETracker(object):
             id_feature = F.normalize(id_feature, dim=1)
 
             reg = output['reg'] if self.opt.reg_offset else None
-            dets, inds = mot_decode(
-                hm, wh, reg=reg, ltrb=self.opt.ltrb, K=self.opt.K)
+            dets, inds = mot_decode(hm,
+                                    wh,
+                                    reg=reg,
+                                    ltrb=self.opt.ltrb,
+                                    K=self.opt.K)
             id_feature = _tranpose_and_gather_feat(id_feature, inds)
             id_feature = id_feature.squeeze(0)
             id_feature = id_feature.cpu().numpy()
@@ -290,23 +297,25 @@ class JDETracker(object):
         # reject warped points outside of image
         for i, det in enumerate(dets):
             det = det.astype(float)
-            row_dict = {
-                "run_id": self.run_id,
-                "target_index": i,
-                "frame_id": self.frame_id,
-                "scenario_id": self.scenario_id,
-                "min_x": det[0],
-                "min_y": det[1],
-                "width": det[2] - det[0],
-                "height": det[3] - det[1],
-                "confidance": det[-1]
-            }
-            self.bulk_upsert_detections.append(row_dict)
-
-#         if len(self.bulk_upsert_detections) > self.bulk_size:
-#             dbc.upsert_bulk_detections(self.bulk_upsert_detections)
-#             self.bulk_upsert_detections: List[dict] = []
-        #     bbox = dets[i][0:4]
+            if self.data_dict['update_database']:
+                row_dict = {
+                    "run_id": self.run_id,
+                    "target_index": i,
+                    "frame_id": self.frame_id,
+                    "scenario_id": self.scenario_id,
+                    "min_x": det[0],
+                    "min_y": det[1],
+                    "width": det[2] - det[0],
+                    "height": det[3] - det[1],
+                    "confidance": det[-1],
+                    "embedding": id_feature[i, :].tolist()
+                }
+                self.bulk_upsert_detections.append(row_dict)
+        if self.data_dict['update_database']:
+            if len(self.bulk_upsert_detections) > self.bulk_size:
+                dbc.upsert_bulk_detections(self.bulk_upsert_detections)
+                self.bulk_upsert_detections: List[dict] = []
+            #     bbox = dets[i][0:4]
 
         #     cv2.rectangle(img0, (bbox[0], bbox[1]),
         #                   (bbox[2], bbox[3]),
@@ -317,11 +326,12 @@ class JDETracker(object):
 
         if len(dets) > 0:
             '''Detections'''
-            detections = [STrack(STrack.tlbr_to_tlwh(tlbrs[:4]), tlbrs[4], f, 30) for
-                          (tlbrs, f) in zip(dets[:, :5], id_feature)]
+            detections = [
+                STrack(STrack.tlbr_to_tlwh(tlbrs[:4]), tlbrs[4], f, 30)
+                for (tlbrs, f) in zip(dets[:, :5], id_feature)
+            ]
         else:
             detections = []
-
         ''' Add newly detected tracklets to tracked_stracks'''
         unconfirmed = []
         tracked_stracks = []  # type: list[STrack]
@@ -330,27 +340,31 @@ class JDETracker(object):
                 unconfirmed.append(track)
             else:
                 tracked_stracks.append(track)
-
         ''' Step 2: First association, with embedding'''
         strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
         # Predict the current location with KF
         # for strack in strack_pool:
         # strack.predict()
-
-        STrack.multi_predict(
-            strack_pool, self.bulk_upsert_kalman_prediction, self.data_dict, self.frame_id)
-#         if len(self.bulk_upsert_kalman_prediction) > self.bulk_size:
-#             dbc.upsert_bulk_kalman(self.bulk_upsert_kalman_prediction)
-#             self.bulk_upsert_kalman_prediction: List[dict] = []
+        STrack.multi_predict(strack_pool, self.bulk_upsert_kalman_prediction,
+                             self.data_dict, self.frame_id)
+        if self.data_dict['update_database']:
+            if len(self.bulk_upsert_kalman_prediction) > self.bulk_size:
+                dbc.upsert_bulk_kalman(self.bulk_upsert_kalman_prediction)
+                self.bulk_upsert_kalman_prediction: List[dict] = []
 
         dists = matching.embedding_distance(strack_pool, detections)
+        cm = dists.copy()
         #dists = matching.iou_distance(strack_pool, detections)
-        dists = matching.fuse_motion(
-            self.kalman_filter, dists, strack_pool, detections)
-        matches, u_track, u_detection = matching.linear_assignment(
+        dists, gm = matching.fuse_motion(self.kalman_filter,
+                                         dists,
+                                         strack_pool,
+                                         detections,
+                                         lambda_=0.5)
+
+        matches_fused, u_track, u_detection = matching.linear_assignment(
             dists, thresh=0.4)
-        matches_dict:Dict[int, int] = {}
-        for itracked, idet in matches:
+        matches_dict: Dict[int, int] = {}
+        for itracked, idet in matches_fused:
             track = strack_pool[itracked]
             det = detections[idet]
             matches_dict[track.track_id] = idet
@@ -361,14 +375,15 @@ class JDETracker(object):
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
-
         ''' Step 3: Second association, with IOU'''
         detections = [detections[i] for i in u_detection]
-        r_tracked_stracks = [strack_pool[i]
-                             for i in u_track if strack_pool[i].state == TrackState.Tracked]
+        r_tracked_stracks = [
+            strack_pool[i] for i in u_track
+            if strack_pool[i].state == TrackState.Tracked
+        ]
         dists = matching.iou_distance(r_tracked_stracks, detections)
-        matches, u_track, u_detection = matching.linear_assignment(
-            dists, thresh=0.5)
+        matches, u_track, u_detection = matching.linear_assignment(dists,
+                                                                   thresh=0)
 
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
@@ -386,7 +401,6 @@ class JDETracker(object):
             if not track.state == TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
-
         '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
         detections = [detections[i] for i in u_detection]
         dists = matching.iou_distance(unconfirmed, detections)
@@ -401,7 +415,6 @@ class JDETracker(object):
             track = unconfirmed[it]
             track.mark_removed()
             removed_stracks.append(track)
-
         """ Step 4: Init new stracks"""
         for inew in u_detection:
             track = detections[inew]
@@ -419,19 +432,18 @@ class JDETracker(object):
         # print('Ramained match {} s'.format(t4-t3))
 
         self.tracked_stracks = [
-            t for t in self.tracked_stracks if t.state == TrackState.Tracked]
+            t for t in self.tracked_stracks if t.state == TrackState.Tracked
+        ]
 
-
-            
-        self.tracked_stracks = joint_stracks(
-            self.tracked_stracks, activated_starcks)
-        self.tracked_stracks = joint_stracks(
-            self.tracked_stracks, refind_stracks)
-        self.lost_stracks = sub_stracks(
-            self.lost_stracks, self.tracked_stracks)
+        self.tracked_stracks = joint_stracks(self.tracked_stracks,
+                                             activated_starcks)
+        self.tracked_stracks = joint_stracks(self.tracked_stracks,
+                                             refind_stracks)
+        self.lost_stracks = sub_stracks(self.lost_stracks,
+                                        self.tracked_stracks)
         self.lost_stracks.extend(lost_stracks)
-        self.lost_stracks = sub_stracks(
-            self.lost_stracks, self.removed_stracks)
+        self.lost_stracks = sub_stracks(self.lost_stracks,
+                                        self.removed_stracks)
         self.removed_stracks.extend(removed_stracks)
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(
             self.tracked_stracks, self.lost_stracks)
@@ -442,24 +454,59 @@ class JDETracker(object):
         for track in self.tracked_stracks:
             if track.is_activated:
                 output_stracks.append(track)
-                row_dict = {
-                    "run_id": self.run_id,
-                    "tracker_id": int(track.track_id),
-                    "frame_id": self.frame_id,
-                    "scenario_id": self.scenario_id,
-                    "target_index": int(matches_dict[track.track_id]),
-                    "min_x": float(track.tlwh[0]),
-                    "min_y": float(track.tlwh[1]),
-                    "width": float(track.tlwh[2]),
-                    "height": float(track.tlwh[3]),
+
+                if self.data_dict['update_database']:
+                    row_dict = {
+                        "run_id": self.run_id,
+                        "tracker_id": int(track.track_id),
+                        "frame_id": self.frame_id,
+                        "scenario_id": self.scenario_id,
+                        "target_index": int(matches_dict[track.track_id]),
+                        "min_x": float(track.tlwh[0]),
+                        "min_y": float(track.tlwh[1]),
+                        "width": float(track.tlwh[2]),
+                        "height": float(track.tlwh[3]),
+                        "embedding": track.smooth_feat.tolist(),
+                        "embedding_distance": None,
+                        "mahalanobis_distance": None,
                     }
-                self.bulk_upsert_trackers.append(row_dict)
+                    if len(
+                            np.argwhere(matches_fused[:, 1] == matches_dict[
+                                track.track_id])):
+                        row_dict["embedding_distance"]= \
+                            float(cm[  int(
+                                matches_fused[np.argwhere(matches_fused[:, 1] ==
+                                            matches_dict[track.track_id]), 0]),int(matches_dict[track.track_id])])
 
-        
-#         if len(self.bulk_upsert_trackers) > self.bulk_size:
-#             dbc.upsert_bulk_tracker(self.bulk_upsert_trackers)
-#             self.bulk_upsert_trackers: List[dict] = []
 
+                        row_dict["mahalanobis_distance"] = \
+                             float(gm[ int(
+                                matches_fused[np.argwhere(matches_fused[:, 1] ==
+                                            matches_dict[track.track_id]), 0]),int(matches_dict[track.track_id])])
+
+                    self.bulk_upsert_trackers.append(row_dict)
+
+        if self.data_dict['update_database']:
+            if cm is not None:
+                for t in range(cm.shape[0]):
+                    for d in range(cm.shape[1]):
+                        row_dict = {
+                            "run_id": self.run_id,
+                            "frame_id": self.frame_id,
+                            "target_id": strack_pool[t].track_id,
+                            "target_index": d,
+                            "scenario_id": self.scenario_id,
+                            "embedding_distance": float(cm[t, d]),
+                            "mahalanobis_distance": float(gm[t, d]),
+                        }
+
+                        self.bulk_upsert_distances.append(row_dict)
+            if len(self.bulk_upsert_distances) > self.bulk_size:
+                dbc.upsert_bulk_distances_data(self.bulk_upsert_distances)
+                self.bulk_upsert_distances: List[dict] = []
+            if len(self.bulk_upsert_trackers) > self.bulk_size:
+                dbc.upsert_bulk_tracker(self.bulk_upsert_trackers)
+                self.bulk_upsert_trackers: List[dict] = []
 
         logger.debug('===========Frame {}=========='.format(self.frame_id))
         logger.debug('Activated: {}'.format(
