@@ -157,6 +157,10 @@ def eval_seq(opt,
         if len(tracker.bulk_upsert_trackers):
             dbc.upsert_bulk_tracker(tracker.bulk_upsert_trackers)
             tracker.bulk_upsert_trackers = []
+        if len(tracker.bulk_upsert_detection_frame):
+            dbc.upsert_bulk_detection_frame(tracker.bulk_upsert_detection_frame)
+            tracker.bulk_upsert_detection_frame = []
+
     write_results(result_filename, results, data_type)
     #write_results_score(result_filename, results, data_type)
     return frame_id, timer.average_time, timer.calls
@@ -176,13 +180,14 @@ def main(opt,
     data_type = 'mot'
 
     # run tracking
-    data_dict = {"run_id": 1}
+    data_dict = {"run_id": 3}
     accs = []
     n_frame = 0
     timer_avgs, timer_calls = [], []
     for seq in seqs:
         print(seq)
         data_dict['scenario_id'] = dbc.get_scenario_props_by_name(seq).id
+        data_dict['scenario_name'] = seq
         output_dir = os.path.join(data_root, '..', 'outputs', exp_name,
                                   seq) if save_images or save_videos else None
         logger.info('start seq: {}'.format(seq))
