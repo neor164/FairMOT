@@ -1,562 +1,347 @@
-import itertools
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import _init_paths
 import os
 import os.path as osp
-import time
-from collections import deque
-
 import cv2
+import logging
+import argparse
+import motmetrics as mm
 import numpy as np
 import torch
-import torch.nn.functional as F
-from models import *
-from models.decode import mot_decode
-from models.model import create_model, load_model
-from models.utils import _tranpose_and_gather_feat
-from tracking_utils.kalman_filter import KalmanFilter
+
+from tracker.multitracker import JDETracker
+from tracking_utils import visualization as vis
 from tracking_utils.log import logger
-from tracking_utils.utils import *
-from utils.image import get_affine_transform
-from utils.post_process import ctdet_post_process
-from tracker import matching
-from mot_postgres.tables.detector_tables import DetectionsProps
+from tracking_utils.timer import Timer
+from tracking_utils.evaluation import Evaluator
+import datasets.dataset.jde as datasets
 from mot_postgres.mot_postgres import dbc
-from .basetrack import BaseTrack, TrackState
-from typing import Optional, List, Dict
+from tracking_utils.utils import mkdir_if_missing
+from opts import opts
+from typing import List
 
 
-class STrack(BaseTrack):
-    shared_kalman = KalmanFilter()
+def write_results(filename, results, data_type):
+    if data_type == 'mot':
+        save_format = '{frame},{id},{x1},{y1},{w},{h},1,-1,-1,-1\n'
+    elif data_type == 'kitti':
+        save_format = '{frame} {id} pedestrian 0 0 -10 {x1} {y1} {x2} {y2} -10 -10 -10 -1000 -1000 -1000 -10\n'
+    else:
+        raise ValueError(data_type)
 
-    def __init__(self, tlwh, score, temp_feat, buffer_size=30):
+    with open(filename, 'w') as f:
+        for frame_id, tlwhs, track_ids in results:
+            if data_type == 'kitti':
+                frame_id -= 1
+            for tlwh, track_id in zip(tlwhs, track_ids):
+                if track_id < 0:
+                    continue
+                x1, y1, w, h = tlwh
+                x2, y2 = x1 + w, y1 + h
+                line = save_format.format(frame=frame_id,
+                                          id=track_id,
+                                          x1=x1,
+                                          y1=y1,
+                                          x2=x2,
+                                          y2=y2,
+                                          w=w,
+                                          h=h)
+                f.write(line)
+    logger.info('save results to {}'.format(filename))
 
-        # wait activate
-        self._tlwh = np.asarray(tlwh, dtype=np.float)
-        self.kalman_filter = None
-        self.mean, self.covariance = None, None
-        self.is_activated = False
-        self.bulk_kalman_upsert: List[dict] = []
-        self.max_bulk_size = 10000
-        self.score = score
-        self.tracklet_len = 0
-        self.smooth_feat = None
-        self.update_features(temp_feat)
-        self.features = deque([], maxlen=buffer_size)
-        self.alpha = 0.9
 
-    def update_features(self, feat):
-        feat /= np.linalg.norm(feat)
-        self.curr_feat = feat
-        if self.smooth_feat is None:
-            self.smooth_feat = feat
+def write_results_score(filename, results, data_type):
+    if data_type == 'mot':
+        save_format = '{frame},{id},{x1},{y1},{w},{h},{s},1,-1,-1,-1\n'
+    elif data_type == 'kitti':
+        save_format = '{frame} {id} pedestrian 0 0 -10 {x1} {y1} {x2} {y2} -10 -10 -10 -1000 -1000 -1000 -10\n'
+    else:
+        raise ValueError(data_type)
+
+    with open(filename, 'w') as f:
+        for frame_id, tlwhs, track_ids, scores in results:
+            if data_type == 'kitti':
+                frame_id -= 1
+            for tlwh, track_id, score in zip(tlwhs, track_ids, scores):
+                if track_id < 0:
+                    continue
+                x1, y1, w, h = tlwh
+                x2, y2 = x1 + w, y1 + h
+                line = save_format.format(frame=frame_id,
+                                          id=track_id,
+                                          x1=x1,
+                                          y1=y1,
+                                          x2=x2,
+                                          y2=y2,
+                                          w=w,
+                                          h=h,
+                                          s=score)
+                f.write(line)
+    logger.info('save results to {}'.format(filename))
+
+
+def eval_seq(opt,
+             dataloader,
+             data_type,
+             result_filename,
+             data_dict,
+             save_dir=None,
+             show_image=True,
+             frame_rate=30,
+             use_cuda=True):
+    if save_dir:
+        mkdir_if_missing(save_dir)
+    data_dict['update_database'] = opt.update_database
+    tracker: JDETracker = JDETracker(opt, data_dict, frame_rate=frame_rate)
+    timer = Timer()
+    results = []
+    frame_id = 0
+    # for path, img, img0 in dataloader:
+    for i, (path, img, img0) in enumerate(dataloader):
+        # if i % 8 != 0:
+        # continue
+
+        if frame_id % 20 == 0:
+            logger.info('Processing frame {} ({:.2f} fps)'.format(
+                frame_id, 1. / max(1e-5, timer.average_time)))
+
+        # run tracking
+        timer.tic()
+        if use_cuda:
+            blob = torch.from_numpy(img).cuda().unsqueeze(0)
         else:
-            self.smooth_feat = self.alpha * \
-                self.smooth_feat + (1 - self.alpha) * feat
-        self.features.append(feat)
-        self.smooth_feat /= np.linalg.norm(self.smooth_feat)
+            blob = torch.from_numpy(img).unsqueeze(0)
+        online_targets = tracker.update(blob, img0)
+        online_tlwhs = []
+        online_ids = []
+        #online_scores = []
+        for t in online_targets:
+            tlwh = t.tlwh
+            tid = t.track_id
+            vertical = tlwh[2] / tlwh[3] > 1.6
+            if tlwh[2] * tlwh[3] > opt.min_box_area and not vertical:
+                online_tlwhs.append(tlwh)
+                online_ids.append(tid)
+                # online_scores.append(t.score)
+        timer.toc()
+        # save results
+        results.append((frame_id + 1, online_tlwhs, online_ids))
+        #results.append((frame_id + 1, online_tlwhs, online_ids, online_scores))
+        if show_image or save_dir is not None:
+            online_im = vis.plot_tracking(img0,
+                                          online_tlwhs,
+                                          online_ids,
+                                          frame_id=frame_id,
+                                          fps=1. / timer.average_time)
+        if show_image:
+            cv2.imshow('online_im', online_im)
+        if save_dir is not None:
+            cv2.imwrite(os.path.join(save_dir, '{:05d}.jpg'.format(frame_id)),
+                        online_im)
+        frame_id += 1
+    # save results
+    if opt.update_database:
+        if len(tracker.bulk_upsert_distances):
+            dbc.upsert_bulk_distances_data(tracker.bulk_upsert_distances)
+            tracker.bulk_upsert_distances = []
+        if len(tracker.bulk_upsert_detections):
+            dbc.upsert_bulk_detections(tracker.bulk_upsert_detections)
+            tracker.bulk_upsert_detections = []
 
-    def predict(self):
-        mean_state = self.mean.copy()
-        if self.state != TrackState.Tracked:
-            mean_state[7] = 0
-        self.mean, self.covariance = self.kalman_filter.predict(
-            mean_state, self.covariance)
+        if len(tracker.bulk_upsert_kalman_prediction):
+            dbc.upsert_bulk_kalman(tracker.bulk_upsert_kalman_prediction)
+            tracker.bulk_upsert_detections = []
+        if len(tracker.bulk_upsert_trackers):
+            dbc.upsert_bulk_tracker(tracker.bulk_upsert_trackers)
+            tracker.bulk_upsert_trackers = []
+        if len(tracker.bulk_upsert_detection_frame):
+            dbc.upsert_bulk_detection_frame(tracker.bulk_upsert_detection_frame)
+            tracker.bulk_upsert_detection_frame = []
 
-    @staticmethod
-    def multi_predict(stracks, bulk_kalman_upsert: List[dict],
-                      data_dict: Dict[str, float], frame_id):
-        if len(stracks) > 0:
-            multi_mean = np.asarray([st.mean.copy() for st in stracks])
-            multi_covariance = np.asarray([st.covariance for st in stracks])
-            for i, st in enumerate(stracks):
-                if st.state != TrackState.Tracked:
-                    multi_mean[i][7] = 0
-            multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(
-                multi_mean, multi_covariance)
-            for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
-                stracks[i].mean = mean
-                stracks[i].covariance = cov
-
-                row_dict = {
-                    "run_id": data_dict['run_id'],
-                    "tracker_id": stracks[i].track_id,
-                    "frame_id": frame_id,
-                    "scenario_id": data_dict['scenario_id'],
-                    "kalman_min_x": stracks[i].tlwh[0],
-                    "kalman_min_y": stracks[i].tlwh[1],
-                    "kalman_width": stracks[i].tlwh[2],
-                    "kalman_height": stracks[i].tlwh[3],
-                    "track_status": stracks[i].state
-                }
-                bulk_kalman_upsert.append(row_dict)
-
-    def activate(self, kalman_filter, frame_id):
-        """Start a new tracklet"""
-        self.kalman_filter = kalman_filter
-        self.track_id = self.next_id()
-        self.mean, self.covariance = self.kalman_filter.initiate(
-            self.tlwh_to_xyah(self._tlwh))
-
-        self.tracklet_len = 0
-        self.state = TrackState.Tracked
-        if frame_id == 1:
-            self.is_activated = True
-        #self.is_activated = True
-        self.frame_id = frame_id
-        self.start_frame = frame_id
-
-    def re_activate(self, new_track, frame_id, new_id=False):
-        self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_track.tlwh),
-            new_track.score)
-
-        self.update_features(new_track.curr_feat)
-        self.tracklet_len = 0
-        self.state = TrackState.Tracked
-        self.is_activated = True
-        self.frame_id = frame_id
-        if new_id:
-            self.track_id = self.next_id()
-
-    def update(self, new_track, frame_id, update_feature=True):
-        """
-        Update a matched track
-        :type new_track: STrack
-        :type frame_id: int
-        :type update_feature: bool
-        :return:
-        """
-        self.frame_id = frame_id
-        self.tracklet_len += 1
-
-        new_tlwh = new_track.tlwh
-        self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_tlwh),
-            new_track.score)
-        self.state = TrackState.Tracked
-        self.is_activated = True
-
-        self.score = new_track.score
-        if update_feature:
-            self.update_features(new_track.curr_feat)
-
-    @property
-    def tlwh(self):
-        """Get current position in bounding box format `(top left x, top left y,
-                width, height)`.
-        """
-        if self.mean is None:
-            return self._tlwh.copy()
-        ret = self.mean[:4].copy()
-        ret[2] *= ret[3]
-        ret[:2] -= ret[2:] / 2
-        return ret
-
-    @property
-    def tlbr(self):
-        """Convert bounding box to format `(min x, min y, max x, max y)`, i.e.,
-        `(top left, bottom right)`.
-        """
-        ret = self.tlwh.copy()
-        ret[2:] += ret[:2]
-        return ret
-
-    @staticmethod
-    def tlwh_to_xyah(tlwh):
-        """Convert bounding box to format `(center x, center y, aspect ratio,
-        height)`, where the aspect ratio is `width / height`.
-        """
-        ret = np.asarray(tlwh).copy()
-        ret[:2] += ret[2:] / 2
-        ret[2] /= ret[3]
-        return ret
-
-    def to_xyah(self):
-        return self.tlwh_to_xyah(self.tlwh)
-
-    @staticmethod
-    def tlbr_to_tlwh(tlbr):
-        ret = np.asarray(tlbr).copy()
-        ret[2:] -= ret[:2]
-        return ret
-
-    @staticmethod
-    def tlwh_to_tlbr(tlwh):
-        ret = np.asarray(tlwh).copy()
-        ret[2:] += ret[:2]
-        return ret
-
-    def __repr__(self):
-        return 'OT_{}_({}-{})'.format(self.track_id, self.start_frame,
-                                      self.end_frame)
+    write_results(result_filename, results, data_type)
+    #write_results_score(result_filename, results, data_type)
+    return frame_id, timer.average_time, timer.calls
 
 
-class JDETracker(object):
-    def __init__(self, opt, data_dict, frame_rate=30):
-        self.opt = opt
-        if opt.gpus[0] >= 0:
-            opt.device = torch.device('cuda')
-        else:
-            opt.device = torch.device('cpu')
-        self.data_dict = data_dict
-        print('Creating model...')
-        self.model = create_model(opt.arch, opt.heads, opt.head_conv)
-        print(torch.cuda.is_available())
-        self.model = load_model(self.model, opt.load_model)
-        self.bulk_upsert_detections: List[dict] = []
-        self.bulk_upsert_distances: List[dict] = []
-        self.bulk_upsert_kalman_prediction: List[dict] = []
-        self.bulk_upsert_trackers: List[dict] = []
-        self.bulk_size: int = 10e3
-        self.model = self.model.to(opt.device)
-        self.model.eval()
-        self.run_id = data_dict['run_id']
-        self.tracked_stracks = []  # type: list[STrack]
-        self.lost_stracks = []  # type: list[STrack]
-        self.removed_stracks = []  # type: list[STrack]
-        self.scenario_id: Optional[int] = data_dict['scenario_id']
-        self.frame_id = 0
-        self.det_thresh = opt.conf_thres
-        self.buffer_size = int(frame_rate / 30.0 * opt.track_buffer)
-        self.max_time_lost = self.buffer_size
-        self.max_per_image = opt.K
-        self.mean = np.array(opt.mean, dtype=np.float32).reshape(1, 1, 3)
-        self.std = np.array(opt.std, dtype=np.float32).reshape(1, 1, 3)
-        self.kalman_filter = KalmanFilter()
+def main(opt,
+         data_root='/data/MOT16/train',
+         det_root=None,
+         seqs=('MOT16-05', ),
+         exp_name='demo',
+         save_images=False,
+         save_videos=False,
+         show_image=True):
+    logger.setLevel(logging.INFO)
+    result_root = os.path.join(data_root, '..', 'results', exp_name)
+    mkdir_if_missing(result_root)
+    data_type = 'mot'
 
-    def post_process(self, dets, meta):
-        dets = dets.detach().cpu().numpy()
-        dets = dets.reshape(1, -1, dets.shape[2])
-        dets = ctdet_post_process(dets.copy(), [meta['c']], [meta['s']],
-                                  meta['out_height'], meta['out_width'],
-                                  self.opt.num_classes)
-        for j in range(1, self.opt.num_classes + 1):
-            dets[0][j] = np.array(dets[0][j], dtype=np.float32).reshape(-1, 5)
-        return dets[0]
+    # run tracking
+    data_dict = {"run_id": 3}
+    accs = []
+    n_frame = 0
+    timer_avgs, timer_calls = [], []
+    for seq in seqs:
+        print(seq)
+        data_dict['scenario_id'] = dbc.get_scenario_props_by_name(seq).id
+        data_dict['scenario_name'] = seq
+        output_dir = os.path.join(data_root, '..', 'outputs', exp_name,
+                                  seq) if save_images or save_videos else None
+        logger.info('start seq: {}'.format(seq))
+        dataloader = datasets.LoadImages(osp.join(data_root, seq, 'img1'),
+                                         opt.img_size)
+        result_filename = os.path.join(result_root, '{}.txt'.format(seq))
+        meta_info = open(os.path.join(data_root, seq, 'seqinfo.ini')).read()
+        frame_rate = int(meta_info[meta_info.find('frameRate') +
+                                   10:meta_info.find('\nseqLength')])
+        nf, ta, tc = eval_seq(opt,
+                              dataloader,
+                              data_type,
+                              result_filename,
+                              data_dict,
+                              save_dir=output_dir,
+                              show_image=show_image,
+                              frame_rate=frame_rate)
+        n_frame += nf
+        timer_avgs.append(ta)
+        timer_calls.append(tc)
 
-    def merge_outputs(self, detections):
-        results = {}
-        for j in range(1, self.opt.num_classes + 1):
-            results[j] = np.concatenate(
-                [detection[j] for detection in detections],
-                axis=0).astype(np.float32)
+        # eval
+        logger.info('Evaluate seq: {}'.format(seq))
+        evaluator = Evaluator(data_root, seq, data_type)
+        accs.append(evaluator.eval_file(result_filename))
+        if save_videos:
+            output_video_path = osp.join(output_dir, '{}.mp4'.format(seq))
+            cmd_str = 'ffmpeg -f image2 -i {}/%05d.jpg -c:v copy {}'.format(
+                output_dir, output_video_path)
+            os.system(cmd_str)
 
-        scores = np.hstack(
-            [results[j][:, 4] for j in range(1, self.opt.num_classes + 1)])
-        if len(scores) > self.max_per_image:
-            kth = len(scores) - self.max_per_image
-            thresh = np.partition(scores, kth)[kth]
-            for j in range(1, self.opt.num_classes + 1):
-                keep_inds = (results[j][:, 4] >= thresh)
-                results[j] = results[j][keep_inds]
-        return results
+    timer_avgs = np.asarray(timer_avgs)
+    timer_calls = np.asarray(timer_calls)
+    all_time = np.dot(timer_avgs, timer_calls)
+    avg_time = all_time / np.sum(timer_calls)
+    logger.info('Time elapsed: {:.2f} seconds, FPS: {:.2f}'.format(
+        all_time, 1.0 / avg_time))
 
-    def update(self, im_blob, img0):
-        self.frame_id += 1
-        activated_starcks = []
-        refind_stracks = []
-        lost_stracks = []
-        removed_stracks = []
-
-        width = img0.shape[1]
-        height = img0.shape[0]
-        inp_height = im_blob.shape[2]
-        inp_width = im_blob.shape[3]
-        c = np.array([width / 2., height / 2.], dtype=np.float32)
-        s = max(float(inp_width) / float(inp_height) * height, width) * 1.0
-        meta = {
-            'c': c,
-            's': s,
-            'out_height': inp_height // self.opt.down_ratio,
-            'out_width': inp_width // self.opt.down_ratio
-        }
-        ''' Step 1: Network forward, get detections & embeddings'''
-        with torch.no_grad():
-            output = self.model(im_blob)[-1]
-            hm = output['hm'].sigmoid_()
-            wh = output['wh']
-            id_feature = output['id']
-            id_feature = F.normalize(id_feature, dim=1)
-
-            reg = output['reg'] if self.opt.reg_offset else None
-            dets, inds = mot_decode(hm,
-                                    wh,
-                                    reg=reg,
-                                    ltrb=self.opt.ltrb,
-                                    K=self.opt.K)
-            id_feature = _tranpose_and_gather_feat(id_feature, inds)
-            id_feature = id_feature.squeeze(0)
-            id_feature = id_feature.cpu().numpy()
-
-        dets = self.post_process(dets, meta)
-        dets = self.merge_outputs([dets])[1]
-
-        remain_inds = dets[:, 4] > self.opt.conf_thres
-        dets = dets[remain_inds]
-        id_feature = id_feature[remain_inds]
-
-        # reject warped points outside of image
-        for i, det in enumerate(dets):
-            det = det.astype(float)
-            if self.data_dict['update_database']:
-                row_dict = {
-                    "run_id": self.run_id,
-                    "target_index": i,
-                    "frame_id": self.frame_id,
-                    "scenario_id": self.scenario_id,
-                    "min_x": det[0],
-                    "min_y": det[1],
-                    "width": det[2] - det[0],
-                    "height": det[3] - det[1],
-                    "confidance": det[-1],
-                    "embedding": id_feature[i, :].tolist()
-                }
-                self.bulk_upsert_detections.append(row_dict)
-        if self.data_dict['update_database']:
-            if len(self.bulk_upsert_detections) > self.bulk_size:
-                dbc.upsert_bulk_detections(self.bulk_upsert_detections)
-                self.bulk_upsert_detections: List[dict] = []
-            #     bbox = dets[i][0:4]
-
-        #     cv2.rectangle(img0, (bbox[0], bbox[1]),
-        #                   (bbox[2], bbox[3]),
-        #                   (0, 255, 0), 2)
-        # cv2.imshow('dets', img0)
-        # cv2.waitKey(0)
-        # id0 = id0-1
-
-        if len(dets) > 0:
-            '''Detections'''
-            detections = [
-                STrack(STrack.tlbr_to_tlwh(tlbrs[:4]), tlbrs[4], f, 30)
-                for (tlbrs, f) in zip(dets[:, :5], id_feature)
-            ]
-        else:
-            detections = []
-        ''' Add newly detected tracklets to tracked_stracks'''
-        unconfirmed = []
-        tracked_stracks = []  # type: list[STrack]
-        for track in self.tracked_stracks:
-            if not track.is_activated:
-                unconfirmed.append(track)
-            else:
-                tracked_stracks.append(track)
-        ''' Step 2: First association, with embedding'''
-        strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
-        # Predict the current location with KF
-        # for strack in strack_pool:
-        # strack.predict()
-        STrack.multi_predict(strack_pool, self.bulk_upsert_kalman_prediction,
-                             self.data_dict, self.frame_id)
-        if self.data_dict['update_database']:
-            if len(self.bulk_upsert_kalman_prediction) > self.bulk_size:
-                dbc.upsert_bulk_kalman(self.bulk_upsert_kalman_prediction)
-                self.bulk_upsert_kalman_prediction: List[dict] = []
-
-        dists = matching.embedding_distance(strack_pool, detections)
-        cm = dists.copy()
-        #dists = matching.iou_distance(strack_pool, detections)
-        dists, gm = matching.fuse_motion(self.kalman_filter,
-                                         dists,
-                                         strack_pool,
-                                         detections,
-                                         lambda_=0.5)
-
-        matches_fused, u_track, u_detection = matching.linear_assignment(
-            dists, thresh=0.4)
-        matches_dict: Dict[int, int] = {}
-        for itracked, idet in matches_fused:
-            track = strack_pool[itracked]
-            det = detections[idet]
-            matches_dict[track.track_id] = idet
-
-            if track.state == TrackState.Tracked:
-                track.update(detections[idet], self.frame_id)
-                activated_starcks.append(track)
-            else:
-                track.re_activate(det, self.frame_id, new_id=False)
-                refind_stracks.append(track)
-        ''' Step 3: Second association, with IOU'''
-        detections = [detections[i] for i in u_detection]
-        r_tracked_stracks = [
-            strack_pool[i] for i in u_track
-            if strack_pool[i].state == TrackState.Tracked
-        ]
-        dists = matching.iou_distance(r_tracked_stracks, detections)
-        matches, u_track, u_detection = matching.linear_assignment(dists,
-                                                                   thresh=0)
-
-        for itracked, idet in matches:
-            track = r_tracked_stracks[itracked]
-            det = detections[idet]
-            matches_dict[track.track_id] = idet
-            if track.state == TrackState.Tracked:
-                track.update(det, self.frame_id)
-                activated_starcks.append(track)
-            else:
-                track.re_activate(det, self.frame_id, new_id=False)
-                refind_stracks.append(track)
-
-        for it in u_track:
-            track = r_tracked_stracks[it]
-            if not track.state == TrackState.Lost:
-                track.mark_lost()
-                lost_stracks.append(track)
-        '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
-        detections = [detections[i] for i in u_detection]
-        dists = matching.iou_distance(unconfirmed, detections)
-        matches, u_unconfirmed, u_detection = matching.linear_assignment(
-            dists, thresh=0.7)
-        for itracked, idet in matches:
-            unconfirmed[itracked].update(detections[idet], self.frame_id)
-            activated_starcks.append(unconfirmed[itracked])
-            matches_dict[unconfirmed[itracked].track_id] = idet
-
-        for it in u_unconfirmed:
-            track = unconfirmed[it]
-            track.mark_removed()
-            removed_stracks.append(track)
-        """ Step 4: Init new stracks"""
-        for inew in u_detection:
-            track = detections[inew]
-            if track.score < self.det_thresh:
-                continue
-            track.activate(self.kalman_filter, self.frame_id)
-            matches_dict[track.track_id] = inew
-            activated_starcks.append(track)
-        """ Step 5: Update state"""
-        for track in self.lost_stracks:
-            if self.frame_id - track.end_frame > self.max_time_lost:
-                track.mark_removed()
-                removed_stracks.append(track)
-
-        # print('Ramained match {} s'.format(t4-t3))
-
-        self.tracked_stracks = [
-            t for t in self.tracked_stracks if t.state == TrackState.Tracked
-        ]
-
-        self.tracked_stracks = joint_stracks(self.tracked_stracks,
-                                             activated_starcks)
-        self.tracked_stracks = joint_stracks(self.tracked_stracks,
-                                             refind_stracks)
-        self.lost_stracks = sub_stracks(self.lost_stracks,
-                                        self.tracked_stracks)
-        self.lost_stracks.extend(lost_stracks)
-        self.lost_stracks = sub_stracks(self.lost_stracks,
-                                        self.removed_stracks)
-        self.removed_stracks.extend(removed_stracks)
-        self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(
-            self.tracked_stracks, self.lost_stracks)
-        # get scores of lost tracks
-        # output_stracks = [
-        #     track for track in self.tracked_stracks if track.is_activated]
-        output_stracks = []
-        for track in self.tracked_stracks:
-            if track.is_activated:
-                output_stracks.append(track)
-
-                if self.data_dict['update_database']:
-                    row_dict = {
-                        "run_id": self.run_id,
-                        "tracker_id": int(track.track_id),
-                        "frame_id": self.frame_id,
-                        "scenario_id": self.scenario_id,
-                        "target_index": int(matches_dict[track.track_id]),
-                        "min_x": float(track.tlwh[0]),
-                        "min_y": float(track.tlwh[1]),
-                        "width": float(track.tlwh[2]),
-                        "height": float(track.tlwh[3]),
-                        "embedding": track.smooth_feat.tolist(),
-                        "embedding_distance": None,
-                        "mahalanobis_distance": None,
-                    }
-                    if len(
-                            np.argwhere(matches_fused[:, 1] == matches_dict[
-                                track.track_id])):
-                        row_dict["embedding_distance"]= \
-                            float(cm[  int(
-                                matches_fused[np.argwhere(matches_fused[:, 1] ==
-                                            matches_dict[track.track_id]), 0]),int(matches_dict[track.track_id])])
+    # get summary
+    metrics = mm.metrics.motchallenge_metrics
+    mh = mm.metrics.create()
+    summary = Evaluator.get_summary(accs, seqs, metrics)
+    strsummary = mm.io.render_summary(summary,
+                                      formatters=mh.formatters,
+                                      namemap=mm.io.motchallenge_metric_names)
+    print(strsummary)
+    Evaluator.save_summary(
+        summary, os.path.join(result_root, 'summary_{}.xlsx'.format(exp_name)))
 
 
-                        row_dict["mahalanobis_distance"] = \
-                             float(gm[ int(
-                                matches_fused[np.argwhere(matches_fused[:, 1] ==
-                                            matches_dict[track.track_id]), 0]),int(matches_dict[track.track_id])])
+if __name__ == '__main__':
+    print(torch.cuda.is_available())
+    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+    opt = opts().init()
+    print(torch.cuda.is_available())
+    if not opt.val_mot16:
+        seqs_str = '''KITTI-13
+                      KITTI-17
+                      ADL-Rundle-6
+                      PETS09-S2L1
+                      TUD-Campus
+                      TUD-Stadtmitte'''
+        #seqs_str = '''TUD-Campus'''
+        data_root = os.path.join(opt.data_dir, 'MOT15/train')
+    else:
+        seqs_str = '''MOT16-02
+                      MOT16-04
+                      MOT16-05
+                      MOT16-09
+                      MOT16-10
+                      MOT16-11
+                      MOT16-13'''
 
-                    self.bulk_upsert_trackers.append(row_dict)
+        data_root = os.path.join(opt.data_dir, 'MOT16/train')
+    if opt.test_mot16:
+        seqs_str = '''MOT16-01
+                      MOT16-03
+                      MOT16-06
+                      MOT16-07
+                      MOT16-08
+                      MOT16-12
+                      MOT16-14'''
 
-        if self.data_dict['update_database']:
-            if cm is not None:
-                for t in range(cm.shape[0]):
-                    for d in range(cm.shape[1]):
-                        row_dict = {
-                            "run_id": self.run_id,
-                            "frame_id": self.frame_id,
-                            "target_id": strack_pool[t].track_id,
-                            "target_index": d,
-                            "scenario_id": self.scenario_id,
-                            "embedding_distance": float(cm[t, d]),
-                            "mahalanobis_distance": float(gm[t, d]),
-                        }
+        #seqs_str = '''MOT16-01 MOT16-07 MOT16-12 MOT16-14'''
+        #seqs_str = '''MOT16-06 MOT16-08'''
+        data_root = os.path.join(opt.data_dir, 'MOT16/test')
+    if opt.test_mot15:
+        seqs_str = '''ADL-Rundle-1
+                      ADL-Rundle-3
+                      AVG-TownCentre
+                      ETH-Crossing
+                      ETH-Jelmoli
+                      ETH-Linthescher
+                      KITTI-16
+                      KITTI-19
+                      PETS09-S2L2
+                      TUD-Crossing
+                      Venice-1'''
+        data_root = os.path.join(opt.data_dir, 'MOT15/test')
+    if opt.test_mot17:
+        seqs_str = '''MOT17-01-SDP
+                      MOT17-03-SDP
+                      MOT17-06-SDP
+                      MOT17-07-SDP
+                      MOT17-08-SDP
+                      MOT17-12-SDP
+                      MOT17-14-SDP'''
+        data_root = os.path.join(opt.data_dir, 'MOT17/test')
+    if opt.val_mot17:
+        seqs_str = '''MOT17-02-SDP
+                      MOT17-04-SDP
+                      MOT17-05-SDP
+                      MOT17-09-SDP
+                      MOT17-10-SDP
+                      MOT17-11-SDP
+                      MOT17-13-SDP'''
+        data_root = os.path.join(opt.data_dir, 'MOT17/train')
+    if opt.val_mot15:
+        seqs_str = '''Venice-2
+                      KITTI-13
+                      KITTI-17
+                      ETH-Bahnhof
+                      ETH-Sunnyday
+                      PETS09-S2L1
+                      TUD-Campus
+                      TUD-Stadtmitte
+                      ADL-Rundle-6
+                      ADL-Rundle-8
+                      ETH-Pedcross2
+                      TUD-Stadtmitte'''
+        data_root = os.path.join(opt.data_dir, 'MOT15/train')
+    if opt.val_mot20:
+        seqs_str = '''MOT20-01
+                      MOT20-02
+                      MOT20-03
+                      MOT20-05
+                      '''
+        data_root = os.path.join(opt.data_dir, 'MOT20/train')
+    if opt.test_mot20:
+        seqs_str = '''MOT20-04
+                      MOT20-06
+                      MOT20-07
+                      MOT20-08
+                      '''
+        data_root = os.path.join(opt.data_dir, 'MOT20/test')
 
-                        self.bulk_upsert_distances.append(row_dict)
-            if len(self.bulk_upsert_distances) > self.bulk_size:
-                dbc.upsert_bulk_distances_data(self.bulk_upsert_distances)
-                self.bulk_upsert_distances: List[dict] = []
-            if len(self.bulk_upsert_trackers) > self.bulk_size:
-                dbc.upsert_bulk_tracker(self.bulk_upsert_trackers)
-                self.bulk_upsert_trackers: List[dict] = []
-
-        logger.debug('===========Frame {}=========='.format(self.frame_id))
-        logger.debug('Activated: {}'.format(
-            [track.track_id for track in activated_starcks]))
-        logger.debug('Refind: {}'.format(
-            [track.track_id for track in refind_stracks]))
-        logger.debug('Lost: {}'.format(
-            [track.track_id for track in lost_stracks]))
-        logger.debug('Removed: {}'.format(
-            [track.track_id for track in removed_stracks]))
-
-        return output_stracks
-
-
-def joint_stracks(tlista, tlistb):
-    exists = {}
-    res = []
-    for t in tlista:
-        exists[t.track_id] = 1
-        res.append(t)
-    for t in tlistb:
-        tid = t.track_id
-        if not exists.get(tid, 0):
-            exists[tid] = 1
-            res.append(t)
-    return res
-
-
-def sub_stracks(tlista, tlistb):
-    stracks = {}
-    for t in tlista:
-        stracks[t.track_id] = t
-    for t in tlistb:
-        tid = t.track_id
-        if stracks.get(tid, 0):
-            del stracks[tid]
-    return list(stracks.values())
-
-
-def remove_duplicate_stracks(stracksa, stracksb):
-    pdist = matching.iou_distance(stracksa, stracksb)
-    pairs = np.where(pdist < 0.15)
-    dupa, dupb = list(), list()
-    for p, q in zip(*pairs):
-        timep = stracksa[p].frame_id - stracksa[p].start_frame
-        timeq = stracksb[q].frame_id - stracksb[q].start_frame
-        if timep > timeq:
-            dupb.append(q)
-        else:
-            dupa.append(p)
-    resa = [t for i, t in enumerate(stracksa) if not i in dupa]
-    resb = [t for i, t in enumerate(stracksb) if not i in dupb]
-    return resa, resb
+    if opt.custom:
+        seqs_str = '''MOT20-03'''
+        data_root = os.path.join(opt.data_dir, 'MOT20/train')
+    seqs = [seq.strip() for seq in seqs_str.split()]
+    main(opt,
+         data_root=data_root,
+         seqs=seqs,
+         exp_name='MOT17_test_public_dla34',
+         show_image=False,
+         save_images=False,
+         save_videos=False)
