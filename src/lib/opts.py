@@ -1,562 +1,253 @@
-import itertools
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import argparse
 import os
-import os.path as osp
-import time
-from collections import deque
+import sys
 
-import cv2
-import numpy as np
-import torch
-import torch.nn.functional as F
-from models import *
-from models.decode import mot_decode
-from models.model import create_model, load_model
-from models.utils import _tranpose_and_gather_feat
-from tracking_utils.kalman_filter import KalmanFilter
-from tracking_utils.log import logger
-from tracking_utils.utils import *
-from utils.image import get_affine_transform
-from utils.post_process import ctdet_post_process
-from tracker import matching
-from mot_postgres.tables.detector_tables import DetectionsProps
-from mot_postgres.mot_postgres import dbc
-from .basetrack import BaseTrack, TrackState
-from typing import Optional, List, Dict
+class opts(object):
+  def __init__(self):
+    self.parser = argparse.ArgumentParser()
+    # basic experiment setting
+    self.parser.add_argument('task', default='mot', help='mot')
+    self.parser.add_argument('--dataset', default='jde', help='jde')
+    self.parser.add_argument('--exp_id', default='default')
+    self.parser.add_argument('--test', action='store_true')
+    #self.parser.add_argument('--load_model', default='../models/ctdet_coco_dla_2x.pth',
+                             #help='path to pretrained model')
+    self.parser.add_argument('--load_model', default='',
+                             help='path to pretrained model')
+    self.parser.add_argument('--resume', action='store_true',
+                             help='resume an experiment. '
+                                  'Reloaded the optimizer parameter and '
+                                  'set load_model to model_last.pth '
+                                  'in the exp dir if load_model is empty.') 
 
+    # system
+    self.parser.add_argument('--gpus', default='2, 3',
+                             help='-1 for CPU, use comma for multiple gpus')
+    self.parser.add_argument('--num_workers', type=int, default=8,
+                             help='dataloader threads. 0 for single-thread.')
+    self.parser.add_argument('--not_cuda_benchmark', action='store_true',
+                             help='disable when the input size is not fixed.')
+    self.parser.add_argument('--seed', type=int, default=317, 
+                             help='random seed') # from CornerNet
 
-class STrack(BaseTrack):
-    shared_kalman = KalmanFilter()
+    # log
+    self.parser.add_argument('--print_iter', type=int, default=0, 
+                             help='disable progress bar and print to screen.')
+    self.parser.add_argument('--hide_data_time', action='store_true',
+                             help='not display time during training.')
+    self.parser.add_argument('--save_all', action='store_true',
+                             help='save model to disk every 5 epochs.')
+    self.parser.add_argument('--metric', default='loss', 
+                             help='main metric to save best model')
+    self.parser.add_argument('--vis_thresh', type=float, default=0.5,
+                             help='visualization threshold.')
+    
+    # model
+    self.parser.add_argument('--arch', default='dla_34', 
+                             help='model architecture. Currently tested'
+                                  'resdcn_34 | resdcn_50 | resfpndcn_34 |'
+                                  'dla_34 | hrnet_18')
+    self.parser.add_argument('--head_conv', type=int, default=-1,
+                             help='conv layer channels for output head'
+                                  '0 for no conv layer'
+                                  '-1 for default setting: '
+                                  '256 for resnets and 256 for dla.')
+    self.parser.add_argument('--down_ratio', type=int, default=4,
+                             help='output stride. Currently only supports 4.')
 
-    def __init__(self, tlwh, score, temp_feat, buffer_size=30):
+    # input
+    self.parser.add_argument('--input_res', type=int, default=-1, 
+                             help='input height and width. -1 for default from '
+                             'dataset. Will be overriden by input_h | input_w')
+    self.parser.add_argument('--input_h', type=int, default=-1, 
+                             help='input height. -1 for default from dataset.')
+    self.parser.add_argument('--input_w', type=int, default=-1, 
+                             help='input width. -1 for default from dataset.')
+    
+    # train
+    self.parser.add_argument('--lr', type=float, default=1e-4,
+                             help='learning rate for batch size 12.')
+    self.parser.add_argument('--lr_step', type=str, default='20',
+                             help='drop learning rate by 10.')
+    self.parser.add_argument('--num_epochs', type=int, default=30,
+                             help='total training epochs.')
+    self.parser.add_argument('--batch_size', type=int, default=12,
+                             help='batch size')
+    self.parser.add_argument('--master_batch_size', type=int, default=-1,
+                             help='batch size on the master gpu.')
+    self.parser.add_argument('--num_iters', type=int, default=-1,
+                             help='default: #samples / batch_size.')
+    self.parser.add_argument('--val_intervals', type=int, default=5,
+                             help='number of epochs to run validation.')
+    self.parser.add_argument('--trainval', action='store_true',
+                             help='include validation in training and '
+                                  'test on test set')
 
-        # wait activate
-        self._tlwh = np.asarray(tlwh, dtype=np.float)
-        self.kalman_filter = None
-        self.mean, self.covariance = None, None
-        self.is_activated = False
-        self.bulk_kalman_upsert: List[dict] = []
-        self.max_bulk_size = 10000
-        self.score = score
-        self.tracklet_len = 0
-        self.smooth_feat = None
-        self.update_features(temp_feat)
-        self.features = deque([], maxlen=buffer_size)
-        self.alpha = 0.9
+    # test
+    self.parser.add_argument('--K', type=int, default=500,
+                             help='max number of output objects.') 
+    self.parser.add_argument('--not_prefetch_test', action='store_true',
+                             help='not use parallal data pre-processing.')
+    self.parser.add_argument('--fix_res', action='store_true',
+                             help='fix testing resolution or keep '
+                                  'the original resolution')
+    self.parser.add_argument('--keep_res', action='store_true',
+                             help='keep the original resolution'
+                                  ' during validation.')
+    # tracking
+    self.parser.add_argument('--test_mot16', default=False, help='test mot16')
+    self.parser.add_argument('--update_database', default=False, help='test mot16')
+    self.parser.add_argument('--custom', default=False, help='custom')
+    self.parser.add_argument('--val_mot15', default=False, help='val mot15')
+    self.parser.add_argument('--test_mot15', default=False, help='test mot15')
+    self.parser.add_argument('--val_mot16', default=False, help='val mot16 or mot15')
+    self.parser.add_argument('--test_mot17', default=False, help='test mot17')
+    self.parser.add_argument('--val_mot17', default=False, help='val mot17')
+    self.parser.add_argument('--val_mot20', default=False, help='val mot20')
+    self.parser.add_argument('--test_mot20', default=False, help='test mot20')
+    self.parser.add_argument('--val_hie', default=False, help='val hie')
+    self.parser.add_argument('--test_hie', default=False, help='test hie')
+    self.parser.add_argument('--conf_thres', type=float, default=0.4, help='confidence thresh for tracking')
+    self.parser.add_argument('--det_thres', type=float, default=0.3, help='confidence thresh for detection')
+    self.parser.add_argument('--nms_thres', type=float, default=0.4, help='iou thresh for nms')
+    self.parser.add_argument('--track_buffer', type=int, default=30, help='tracking buffer')
+    self.parser.add_argument('--min-box-area', type=float, default=100, help='filter out tiny boxes')
+    self.parser.add_argument('--input-video', type=str,
+                             default='../videos/MOT16-03.mp4',
+                             help='path to the input video')
+    self.parser.add_argument('--output-format', type=str, default='video', help='video or text')
+    self.parser.add_argument('--output-root', type=str, default='../demos', help='expected output root path')
 
-    def update_features(self, feat):
-        feat /= np.linalg.norm(feat)
-        self.curr_feat = feat
-        if self.smooth_feat is None:
-            self.smooth_feat = feat
-        else:
-            self.smooth_feat = self.alpha * \
-                self.smooth_feat + (1 - self.alpha) * feat
-        self.features.append(feat)
-        self.smooth_feat /= np.linalg.norm(self.smooth_feat)
+    # mot
+    self.parser.add_argument('--data_cfg', type=str,
+                             default='../src/lib/cfg/data.json',
+                             help='load data from cfg')
+    self.parser.add_argument('--data_dir', type=str, default='/data')
 
-    def predict(self):
-        mean_state = self.mean.copy()
-        if self.state != TrackState.Tracked:
-            mean_state[7] = 0
-        self.mean, self.covariance = self.kalman_filter.predict(
-            mean_state, self.covariance)
+    # loss
+    self.parser.add_argument('--mse_loss', action='store_true',
+                             help='use mse loss or focal loss to train '
+                                  'keypoint heatmaps.')
 
-    @staticmethod
-    def multi_predict(stracks, bulk_kalman_upsert: List[dict],
-                      data_dict: Dict[str, float], frame_id):
-        if len(stracks) > 0:
-            multi_mean = np.asarray([st.mean.copy() for st in stracks])
-            multi_covariance = np.asarray([st.covariance for st in stracks])
-            for i, st in enumerate(stracks):
-                if st.state != TrackState.Tracked:
-                    multi_mean[i][7] = 0
-            multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(
-                multi_mean, multi_covariance)
-            for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
-                stracks[i].mean = mean
-                stracks[i].covariance = cov
+    self.parser.add_argument('--reg_loss', default='l1',
+                             help='regression loss: sl1 | l1 | l2')
+    self.parser.add_argument('--hm_weight', type=float, default=1,
+                             help='loss weight for keypoint heatmaps.')
+    self.parser.add_argument('--off_weight', type=float, default=1,
+                             help='loss weight for keypoint local offsets.')
+    self.parser.add_argument('--wh_weight', type=float, default=0.1,
+                             help='loss weight for bounding box size.')
+    self.parser.add_argument('--id_loss', default='ce',
+                             help='reid loss: ce | focal')
+    self.parser.add_argument('--id_weight', type=float, default=1,
+                             help='loss weight for id')
+    self.parser.add_argument('--reid_dim', type=int, default=128,
+                             help='feature dim for reid')
+    self.parser.add_argument('--ltrb', default=True,
+                             help='regress left, top, right, bottom of bbox')
+    self.parser.add_argument('--multi_loss', default='uncertainty', help='multi_task loss: uncertainty | fix')
 
-                row_dict = {
-                    "run_id": data_dict['run_id'],
-                    "tracker_id": stracks[i].track_id,
-                    "frame_id": frame_id,
-                    "scenario_id": data_dict['scenario_id'],
-                    "kalman_min_x": stracks[i].tlwh[0],
-                    "kalman_min_y": stracks[i].tlwh[1],
-                    "kalman_width": stracks[i].tlwh[2],
-                    "kalman_height": stracks[i].tlwh[3],
-                    "track_status": stracks[i].state
-                }
-                bulk_kalman_upsert.append(row_dict)
+    self.parser.add_argument('--norm_wh', action='store_true',
+                             help='L1(\hat(y) / y, 1) or L1(\hat(y), y)')
+    self.parser.add_argument('--dense_wh', action='store_true',
+                             help='apply weighted regression near center or '
+                                  'just apply regression on center point.')
+    self.parser.add_argument('--cat_spec_wh', action='store_true',
+                             help='category specific bounding box size.')
+    self.parser.add_argument('--not_reg_offset', action='store_true',
+                             help='not regress local offset.')
 
-    def activate(self, kalman_filter, frame_id):
-        """Start a new tracklet"""
-        self.kalman_filter = kalman_filter
-        self.track_id = self.next_id()
-        self.mean, self.covariance = self.kalman_filter.initiate(
-            self.tlwh_to_xyah(self._tlwh))
+  def parse(self, args=''):
+    if args == '':
+      opt = self.parser.parse_args()
+    else:
+      opt = self.parser.parse_args(args)
 
-        self.tracklet_len = 0
-        self.state = TrackState.Tracked
-        if frame_id == 1:
-            self.is_activated = True
-        #self.is_activated = True
-        self.frame_id = frame_id
-        self.start_frame = frame_id
+    opt.gpus_str = opt.gpus
+    opt.gpus = [int(gpu) for gpu in opt.gpus.split(',')]
+    opt.lr_step = [int(i) for i in opt.lr_step.split(',')]
 
-    def re_activate(self, new_track, frame_id, new_id=False):
-        self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_track.tlwh),
-            new_track.score)
+    opt.fix_res = not opt.keep_res
+    print('Fix size testing.' if opt.fix_res else 'Keep resolution testing.')
+    opt.reg_offset = not opt.not_reg_offset
 
-        self.update_features(new_track.curr_feat)
-        self.tracklet_len = 0
-        self.state = TrackState.Tracked
-        self.is_activated = True
-        self.frame_id = frame_id
-        if new_id:
-            self.track_id = self.next_id()
+    if opt.head_conv == -1: # init default head_conv
+      opt.head_conv = 256 if 'dla' in opt.arch else 256
+    opt.pad = 31
+    opt.num_stacks = 1
 
-    def update(self, new_track, frame_id, update_feature=True):
-        """
-        Update a matched track
-        :type new_track: STrack
-        :type frame_id: int
-        :type update_feature: bool
-        :return:
-        """
-        self.frame_id = frame_id
-        self.tracklet_len += 1
+    if opt.trainval:
+      opt.val_intervals = 100000000
 
-        new_tlwh = new_track.tlwh
-        self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_tlwh),
-            new_track.score)
-        self.state = TrackState.Tracked
-        self.is_activated = True
+    if opt.master_batch_size == -1:
+      opt.master_batch_size = opt.batch_size // len(opt.gpus)
+    rest_batch_size = (opt.batch_size - opt.master_batch_size)
+    opt.chunk_sizes = [opt.master_batch_size]
+    for i in range(len(opt.gpus) - 1):
+      slave_chunk_size = rest_batch_size // (len(opt.gpus) - 1)
+      if i < rest_batch_size % (len(opt.gpus) - 1):
+        slave_chunk_size += 1
+      opt.chunk_sizes.append(slave_chunk_size)
+    print('training chunk_sizes:', opt.chunk_sizes)
 
-        self.score = new_track.score
-        if update_feature:
-            self.update_features(new_track.curr_feat)
+    opt.root_dir = os.path.join(os.path.dirname(__file__), '..', '..')
+    opt.exp_dir = os.path.join(opt.root_dir, 'exp', opt.task)
+    opt.save_dir = os.path.join(opt.exp_dir, opt.exp_id)
+    opt.debug_dir = os.path.join(opt.save_dir, 'debug')
+    print('The output will be saved to ', opt.save_dir)
+    
+    if opt.resume and opt.load_model == '':
+      model_path = opt.save_dir[:-4] if opt.save_dir.endswith('TEST') \
+                  else opt.save_dir
+      opt.load_model = os.path.join(model_path, 'model_last.pth')
+    return opt
 
-    @property
-    def tlwh(self):
-        """Get current position in bounding box format `(top left x, top left y,
-                width, height)`.
-        """
-        if self.mean is None:
-            return self._tlwh.copy()
-        ret = self.mean[:4].copy()
-        ret[2] *= ret[3]
-        ret[:2] -= ret[2:] / 2
-        return ret
+  def update_dataset_info_and_set_heads(self, opt, dataset):
+    input_h, input_w = dataset.default_resolution
+    opt.mean, opt.std = dataset.mean, dataset.std
+    opt.num_classes = dataset.num_classes
 
-    @property
-    def tlbr(self):
-        """Convert bounding box to format `(min x, min y, max x, max y)`, i.e.,
-        `(top left, bottom right)`.
-        """
-        ret = self.tlwh.copy()
-        ret[2:] += ret[:2]
-        return ret
+    # input_h(w): opt.input_h overrides opt.input_res overrides dataset default
+    input_h = opt.input_res if opt.input_res > 0 else input_h
+    input_w = opt.input_res if opt.input_res > 0 else input_w
+    opt.input_h = opt.input_h if opt.input_h > 0 else input_h
+    opt.input_w = opt.input_w if opt.input_w > 0 else input_w
+    opt.output_h = opt.input_h // opt.down_ratio
+    opt.output_w = opt.input_w // opt.down_ratio
+    opt.input_res = max(opt.input_h, opt.input_w)
+    opt.output_res = max(opt.output_h, opt.output_w)
 
-    @staticmethod
-    def tlwh_to_xyah(tlwh):
-        """Convert bounding box to format `(center x, center y, aspect ratio,
-        height)`, where the aspect ratio is `width / height`.
-        """
-        ret = np.asarray(tlwh).copy()
-        ret[:2] += ret[2:] / 2
-        ret[2] /= ret[3]
-        return ret
+    if opt.task == 'mot':
+      opt.heads = {'hm': opt.num_classes,
+                   'wh': 2 if not opt.ltrb else 4,
+                   'id': opt.reid_dim}
+      if opt.reg_offset:
+        opt.heads.update({'reg': 2})
+      opt.nID = dataset.nID
+      opt.img_size = (1088, 608)
+      #opt.img_size = (864, 480)
+      #opt.img_size = (576, 320)
+    else:
+      assert 0, 'task not defined!'
+    print('heads', opt.heads)
+    return opt
 
-    def to_xyah(self):
-        return self.tlwh_to_xyah(self.tlwh)
-
-    @staticmethod
-    def tlbr_to_tlwh(tlbr):
-        ret = np.asarray(tlbr).copy()
-        ret[2:] -= ret[:2]
-        return ret
-
-    @staticmethod
-    def tlwh_to_tlbr(tlwh):
-        ret = np.asarray(tlwh).copy()
-        ret[2:] += ret[:2]
-        return ret
-
-    def __repr__(self):
-        return 'OT_{}_({}-{})'.format(self.track_id, self.start_frame,
-                                      self.end_frame)
-
-
-class JDETracker(object):
-    def __init__(self, opt, data_dict, frame_rate=30):
-        self.opt = opt
-        if opt.gpus[0] >= 0:
-            opt.device = torch.device('cuda')
-        else:
-            opt.device = torch.device('cpu')
-        self.data_dict = data_dict
-        print('Creating model...')
-        self.model = create_model(opt.arch, opt.heads, opt.head_conv)
-        print(torch.cuda.is_available())
-        self.model = load_model(self.model, opt.load_model)
-        self.bulk_upsert_detections: List[dict] = []
-        self.bulk_upsert_distances: List[dict] = []
-        self.bulk_upsert_kalman_prediction: List[dict] = []
-        self.bulk_upsert_trackers: List[dict] = []
-        self.bulk_size: int = 10e3
-        self.model = self.model.to(opt.device)
-        self.model.eval()
-        self.run_id = data_dict['run_id']
-        self.tracked_stracks = []  # type: list[STrack]
-        self.lost_stracks = []  # type: list[STrack]
-        self.removed_stracks = []  # type: list[STrack]
-        self.scenario_id: Optional[int] = data_dict['scenario_id']
-        self.frame_id = 0
-        self.det_thresh = opt.conf_thres
-        self.buffer_size = int(frame_rate / 30.0 * opt.track_buffer)
-        self.max_time_lost = self.buffer_size
-        self.max_per_image = opt.K
-        self.mean = np.array(opt.mean, dtype=np.float32).reshape(1, 1, 3)
-        self.std = np.array(opt.std, dtype=np.float32).reshape(1, 1, 3)
-        self.kalman_filter = KalmanFilter()
-
-    def post_process(self, dets, meta):
-        dets = dets.detach().cpu().numpy()
-        dets = dets.reshape(1, -1, dets.shape[2])
-        dets = ctdet_post_process(dets.copy(), [meta['c']], [meta['s']],
-                                  meta['out_height'], meta['out_width'],
-                                  self.opt.num_classes)
-        for j in range(1, self.opt.num_classes + 1):
-            dets[0][j] = np.array(dets[0][j], dtype=np.float32).reshape(-1, 5)
-        return dets[0]
-
-    def merge_outputs(self, detections):
-        results = {}
-        for j in range(1, self.opt.num_classes + 1):
-            results[j] = np.concatenate(
-                [detection[j] for detection in detections],
-                axis=0).astype(np.float32)
-
-        scores = np.hstack(
-            [results[j][:, 4] for j in range(1, self.opt.num_classes + 1)])
-        if len(scores) > self.max_per_image:
-            kth = len(scores) - self.max_per_image
-            thresh = np.partition(scores, kth)[kth]
-            for j in range(1, self.opt.num_classes + 1):
-                keep_inds = (results[j][:, 4] >= thresh)
-                results[j] = results[j][keep_inds]
-        return results
-
-    def update(self, im_blob, img0):
-        self.frame_id += 1
-        activated_starcks = []
-        refind_stracks = []
-        lost_stracks = []
-        removed_stracks = []
-
-        width = img0.shape[1]
-        height = img0.shape[0]
-        inp_height = im_blob.shape[2]
-        inp_width = im_blob.shape[3]
-        c = np.array([width / 2., height / 2.], dtype=np.float32)
-        s = max(float(inp_width) / float(inp_height) * height, width) * 1.0
-        meta = {
-            'c': c,
-            's': s,
-            'out_height': inp_height // self.opt.down_ratio,
-            'out_width': inp_width // self.opt.down_ratio
-        }
-        ''' Step 1: Network forward, get detections & embeddings'''
-        with torch.no_grad():
-            output = self.model(im_blob)[-1]
-            hm = output['hm'].sigmoid_()
-            wh = output['wh']
-            id_feature = output['id']
-            id_feature = F.normalize(id_feature, dim=1)
-
-            reg = output['reg'] if self.opt.reg_offset else None
-            dets, inds = mot_decode(hm,
-                                    wh,
-                                    reg=reg,
-                                    ltrb=self.opt.ltrb,
-                                    K=self.opt.K)
-            id_feature = _tranpose_and_gather_feat(id_feature, inds)
-            id_feature = id_feature.squeeze(0)
-            id_feature = id_feature.cpu().numpy()
-
-        dets = self.post_process(dets, meta)
-        dets = self.merge_outputs([dets])[1]
-
-        remain_inds = dets[:, 4] > self.opt.conf_thres
-        dets = dets[remain_inds]
-        id_feature = id_feature[remain_inds]
-
-        # reject warped points outside of image
-        for i, det in enumerate(dets):
-            det = det.astype(float)
-            if self.data_dict['update_database']:
-                row_dict = {
-                    "run_id": self.run_id,
-                    "target_index": i,
-                    "frame_id": self.frame_id,
-                    "scenario_id": self.scenario_id,
-                    "min_x": det[0],
-                    "min_y": det[1],
-                    "width": det[2] - det[0],
-                    "height": det[3] - det[1],
-                    "confidance": det[-1],
-                    "embedding": id_feature[i, :].tolist()
-                }
-                self.bulk_upsert_detections.append(row_dict)
-        if self.data_dict['update_database']:
-            if len(self.bulk_upsert_detections) > self.bulk_size:
-                dbc.upsert_bulk_detections(self.bulk_upsert_detections)
-                self.bulk_upsert_detections: List[dict] = []
-            #     bbox = dets[i][0:4]
-
-        #     cv2.rectangle(img0, (bbox[0], bbox[1]),
-        #                   (bbox[2], bbox[3]),
-        #                   (0, 255, 0), 2)
-        # cv2.imshow('dets', img0)
-        # cv2.waitKey(0)
-        # id0 = id0-1
-
-        if len(dets) > 0:
-            '''Detections'''
-            detections = [
-                STrack(STrack.tlbr_to_tlwh(tlbrs[:4]), tlbrs[4], f, 30)
-                for (tlbrs, f) in zip(dets[:, :5], id_feature)
-            ]
-        else:
-            detections = []
-        ''' Add newly detected tracklets to tracked_stracks'''
-        unconfirmed = []
-        tracked_stracks = []  # type: list[STrack]
-        for track in self.tracked_stracks:
-            if not track.is_activated:
-                unconfirmed.append(track)
-            else:
-                tracked_stracks.append(track)
-        ''' Step 2: First association, with embedding'''
-        strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
-        # Predict the current location with KF
-        # for strack in strack_pool:
-        # strack.predict()
-        STrack.multi_predict(strack_pool, self.bulk_upsert_kalman_prediction,
-                             self.data_dict, self.frame_id)
-        if self.data_dict['update_database']:
-            if len(self.bulk_upsert_kalman_prediction) > self.bulk_size:
-                dbc.upsert_bulk_kalman(self.bulk_upsert_kalman_prediction)
-                self.bulk_upsert_kalman_prediction: List[dict] = []
-
-        dists = matching.embedding_distance(strack_pool, detections)
-        cm = dists.copy()
-        #dists = matching.iou_distance(strack_pool, detections)
-        dists, gm = matching.fuse_motion(self.kalman_filter,
-                                         dists,
-                                         strack_pool,
-                                         detections,
-                                         lambda_=0.5)
-
-        matches_fused, u_track, u_detection = matching.linear_assignment(
-            dists, thresh=0.4)
-        matches_dict: Dict[int, int] = {}
-        for itracked, idet in matches_fused:
-            track = strack_pool[itracked]
-            det = detections[idet]
-            matches_dict[track.track_id] = idet
-
-            if track.state == TrackState.Tracked:
-                track.update(detections[idet], self.frame_id)
-                activated_starcks.append(track)
-            else:
-                track.re_activate(det, self.frame_id, new_id=False)
-                refind_stracks.append(track)
-        ''' Step 3: Second association, with IOU'''
-        detections = [detections[i] for i in u_detection]
-        r_tracked_stracks = [
-            strack_pool[i] for i in u_track
-            if strack_pool[i].state == TrackState.Tracked
-        ]
-        dists = matching.iou_distance(r_tracked_stracks, detections)
-        matches, u_track, u_detection = matching.linear_assignment(dists,
-                                                                   thresh=0)
-
-        for itracked, idet in matches:
-            track = r_tracked_stracks[itracked]
-            det = detections[idet]
-            matches_dict[track.track_id] = idet
-            if track.state == TrackState.Tracked:
-                track.update(det, self.frame_id)
-                activated_starcks.append(track)
-            else:
-                track.re_activate(det, self.frame_id, new_id=False)
-                refind_stracks.append(track)
-
-        for it in u_track:
-            track = r_tracked_stracks[it]
-            if not track.state == TrackState.Lost:
-                track.mark_lost()
-                lost_stracks.append(track)
-        '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
-        detections = [detections[i] for i in u_detection]
-        dists = matching.iou_distance(unconfirmed, detections)
-        matches, u_unconfirmed, u_detection = matching.linear_assignment(
-            dists, thresh=0.7)
-        for itracked, idet in matches:
-            unconfirmed[itracked].update(detections[idet], self.frame_id)
-            activated_starcks.append(unconfirmed[itracked])
-            matches_dict[unconfirmed[itracked].track_id] = idet
-
-        for it in u_unconfirmed:
-            track = unconfirmed[it]
-            track.mark_removed()
-            removed_stracks.append(track)
-        """ Step 4: Init new stracks"""
-        for inew in u_detection:
-            track = detections[inew]
-            if track.score < self.det_thresh:
-                continue
-            track.activate(self.kalman_filter, self.frame_id)
-            matches_dict[track.track_id] = inew
-            activated_starcks.append(track)
-        """ Step 5: Update state"""
-        for track in self.lost_stracks:
-            if self.frame_id - track.end_frame > self.max_time_lost:
-                track.mark_removed()
-                removed_stracks.append(track)
-
-        # print('Ramained match {} s'.format(t4-t3))
-
-        self.tracked_stracks = [
-            t for t in self.tracked_stracks if t.state == TrackState.Tracked
-        ]
-
-        self.tracked_stracks = joint_stracks(self.tracked_stracks,
-                                             activated_starcks)
-        self.tracked_stracks = joint_stracks(self.tracked_stracks,
-                                             refind_stracks)
-        self.lost_stracks = sub_stracks(self.lost_stracks,
-                                        self.tracked_stracks)
-        self.lost_stracks.extend(lost_stracks)
-        self.lost_stracks = sub_stracks(self.lost_stracks,
-                                        self.removed_stracks)
-        self.removed_stracks.extend(removed_stracks)
-        self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(
-            self.tracked_stracks, self.lost_stracks)
-        # get scores of lost tracks
-        # output_stracks = [
-        #     track for track in self.tracked_stracks if track.is_activated]
-        output_stracks = []
-        for track in self.tracked_stracks:
-            if track.is_activated:
-                output_stracks.append(track)
-
-                if self.data_dict['update_database']:
-                    row_dict = {
-                        "run_id": self.run_id,
-                        "tracker_id": int(track.track_id),
-                        "frame_id": self.frame_id,
-                        "scenario_id": self.scenario_id,
-                        "target_index": int(matches_dict[track.track_id]),
-                        "min_x": float(track.tlwh[0]),
-                        "min_y": float(track.tlwh[1]),
-                        "width": float(track.tlwh[2]),
-                        "height": float(track.tlwh[3]),
-                        "embedding": track.smooth_feat.tolist(),
-                        "embedding_distance": None,
-                        "mahalanobis_distance": None,
-                    }
-                    if len(
-                            np.argwhere(matches_fused[:, 1] == matches_dict[
-                                track.track_id])):
-                        row_dict["embedding_distance"]= \
-                            float(cm[  int(
-                                matches_fused[np.argwhere(matches_fused[:, 1] ==
-                                            matches_dict[track.track_id]), 0]),int(matches_dict[track.track_id])])
-
-
-                        row_dict["mahalanobis_distance"] = \
-                             float(gm[ int(
-                                matches_fused[np.argwhere(matches_fused[:, 1] ==
-                                            matches_dict[track.track_id]), 0]),int(matches_dict[track.track_id])])
-
-                    self.bulk_upsert_trackers.append(row_dict)
-
-        if self.data_dict['update_database']:
-            if cm is not None:
-                for t in range(cm.shape[0]):
-                    for d in range(cm.shape[1]):
-                        row_dict = {
-                            "run_id": self.run_id,
-                            "frame_id": self.frame_id,
-                            "target_id": strack_pool[t].track_id,
-                            "target_index": d,
-                            "scenario_id": self.scenario_id,
-                            "embedding_distance": float(cm[t, d]),
-                            "mahalanobis_distance": float(gm[t, d]),
-                        }
-
-                        self.bulk_upsert_distances.append(row_dict)
-            if len(self.bulk_upsert_distances) > self.bulk_size:
-                dbc.upsert_bulk_distances_data(self.bulk_upsert_distances)
-                self.bulk_upsert_distances: List[dict] = []
-            if len(self.bulk_upsert_trackers) > self.bulk_size:
-                dbc.upsert_bulk_tracker(self.bulk_upsert_trackers)
-                self.bulk_upsert_trackers: List[dict] = []
-
-        logger.debug('===========Frame {}=========='.format(self.frame_id))
-        logger.debug('Activated: {}'.format(
-            [track.track_id for track in activated_starcks]))
-        logger.debug('Refind: {}'.format(
-            [track.track_id for track in refind_stracks]))
-        logger.debug('Lost: {}'.format(
-            [track.track_id for track in lost_stracks]))
-        logger.debug('Removed: {}'.format(
-            [track.track_id for track in removed_stracks]))
-
-        return output_stracks
-
-
-def joint_stracks(tlista, tlistb):
-    exists = {}
-    res = []
-    for t in tlista:
-        exists[t.track_id] = 1
-        res.append(t)
-    for t in tlistb:
-        tid = t.track_id
-        if not exists.get(tid, 0):
-            exists[tid] = 1
-            res.append(t)
-    return res
-
-
-def sub_stracks(tlista, tlistb):
-    stracks = {}
-    for t in tlista:
-        stracks[t.track_id] = t
-    for t in tlistb:
-        tid = t.track_id
-        if stracks.get(tid, 0):
-            del stracks[tid]
-    return list(stracks.values())
-
-
-def remove_duplicate_stracks(stracksa, stracksb):
-    pdist = matching.iou_distance(stracksa, stracksb)
-    pairs = np.where(pdist < 0.15)
-    dupa, dupb = list(), list()
-    for p, q in zip(*pairs):
-        timep = stracksa[p].frame_id - stracksa[p].start_frame
-        timeq = stracksb[q].frame_id - stracksb[q].start_frame
-        if timep > timeq:
-            dupb.append(q)
-        else:
-            dupa.append(p)
-    resa = [t for i, t in enumerate(stracksa) if not i in dupa]
-    resb = [t for i, t in enumerate(stracksb) if not i in dupb]
-    return resa, resb
+  def init(self, args=''):
+    default_dataset_info = {
+      'mot': {'default_resolution': [608, 1088], 'num_classes': 1,
+                'mean': [0.408, 0.447, 0.470], 'std': [0.289, 0.274, 0.278],
+                'dataset': 'jde', 'nID': 14455},
+    }
+    class Struct:
+      def __init__(self, entries):
+        for k, v in entries.items():
+          self.__setattr__(k, v)
+    opt = self.parse(args)
+    dataset = Struct(default_dataset_info[opt.task])
+    opt.dataset = dataset.dataset
+    opt = self.update_dataset_info_and_set_heads(opt, dataset)
+    return opt
