@@ -18,7 +18,7 @@ from tracking_utils.log import logger
 from tracking_utils.timer import Timer
 from tracking_utils.evaluation import Evaluator
 import datasets.dataset.jde as datasets
-
+from fake_detector import MotSynthDetector
 from tracking_utils.utils import mkdir_if_missing
 from opts import opts
 
@@ -75,14 +75,14 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
     results = []
     frame_id = 0
     print(f'III) found GPU: {torch.cuda.is_available()}')
-
+    
     #for path, img, img0 in dataloader:
     for i, (path, img, img0) in enumerate(dataloader):
         #if i % 8 != 0:
             #continue
         if frame_id % 20 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
-
+        # bbs = fois_detector.get_bbs_by_frame(frame_id)
         # run tracking
         timer.tic()
         if use_cuda:
@@ -119,7 +119,7 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
     return frame_id, timer.average_time, timer.calls
 
 
-def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), exp_name='demo',
+def main(opt, data_root='/data', det_root=None, seqs=('MOT16-05',), exp_name='demo',
          save_images=False, save_videos=False, show_image=True):
     print(f'III) found GPU: {torch.cuda.is_available()}')
 
@@ -135,9 +135,19 @@ def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), 
     for seq in seqs:
         output_dir = os.path.join(data_root, '..', 'outputs', exp_name, seq) if save_images or save_videos else None
         logger.info('start seq: {}'.format(seq))
-        dataloader = datasets.LoadImages(osp.join(data_root, seq, 'img1'), opt.img_size)
+        if opt.mot_synth:
+            data_path = osp.join(data_root,'imgs','frames', seq, 'rgb')
+            # annotations_path = os.path.join(data_root,'mot_annotations', seq)
+            anns_json_path = f'/app/FairMOT/annotations/{seq}.json'
+            fois_detector = MotSynthDetector(anns_json_path)
+            opt.fois_detector = fois_detector
+        else:
+            data_path = osp.join(data_root, seq, 'img1')
+        annotations_path = os.path.join(data_root, seq)
+        dataloader = datasets.LoadImages(data_path, opt.img_size)
         result_filename = os.path.join(result_root, '{}.txt'.format(seq))
-        meta_info = open(os.path.join(data_root, seq, 'seqinfo.ini')).read()
+        
+        meta_info = open(os.path.join(annotations_path, 'seqinfo.ini')).read()
         frame_rate = int(meta_info[meta_info.find('frameRate') + 10:meta_info.find('\nseqLength')])
         nf, ta, tc = eval_seq(opt, dataloader, data_type, result_filename,
                               save_dir=output_dir, show_image=show_image, frame_rate=frame_rate)
@@ -147,6 +157,7 @@ def main(opt, data_root='/data/MOT16/train', det_root=None, seqs=('MOT16-05',), 
 
         # eval
         logger.info('Evaluate seq: {}'.format(seq))
+        # data_root = '/data/MOTSynth'
         evaluator = Evaluator(data_root, seq, data_type)
         accs.append(evaluator.eval_file(result_filename))
         if save_videos:
@@ -229,6 +240,8 @@ if __name__ == '__main__':
                       MOT17-12-SDP
                       MOT17-14-SDP'''
         data_root = os.path.join(opt.data_dir, 'MOT17/images/test')
+
+
     if opt.val_mot17:
         seqs_str = '''MOT17-02-SDP
                       MOT17-04-SDP
@@ -265,13 +278,17 @@ if __name__ == '__main__':
                       MOT20-07
                       MOT20-08
                       '''
-        data_root = os.path.join(opt.data_dir, 'MOT20/images/test')
+    if opt.mot_synth:
+        seqs_str = '''
+                        033
+                      '''
+        data_root = os.path.join(opt.data_dir, 'MOTSynth')
     seqs = [seq.strip() for seq in seqs_str.split()]
 
     main(opt,
          data_root=data_root,
          seqs=seqs,
-         exp_name='MOT17_test_public_dla34',
+         exp_name='MOTSynth',
          show_image=False,
          save_images=False,
-         save_videos=False)
+         save_videos=True)

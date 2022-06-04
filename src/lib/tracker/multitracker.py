@@ -17,7 +17,7 @@ from tracking_utils.log import logger
 from tracking_utils.utils import *
 from utils.image import get_affine_transform
 from utils.post_process import ctdet_post_process
-
+from matplotlib.patches import Rectangle
 from tracker import matching
 
 from .basetrack import BaseTrack, TrackState
@@ -184,7 +184,7 @@ class JDETracker(object):
         self.tracked_stracks = []  # type: list[STrack]
         self.lost_stracks = []  # type: list[STrack]
         self.removed_stracks = []  # type: list[STrack]
-
+        self.fois_detector = opt.fois_detector
         self.frame_id = 0
         self.det_thresh = opt.conf_thres
         self.buffer_size = int(frame_rate / 30.0 * opt.track_buffer)
@@ -227,7 +227,6 @@ class JDETracker(object):
         refind_stracks = []
         lost_stracks = []
         removed_stracks = []
-
         width = img0.shape[1]
         height = img0.shape[0]
         inp_height = im_blob.shape[2]
@@ -245,7 +244,6 @@ class JDETracker(object):
             wh = output['wh']
             id_feature = output['id']
             id_feature = F.normalize(id_feature, dim=1)
-
             reg = output['reg'] if self.opt.reg_offset else None
             dets, inds = mot_decode(hm, wh, reg=reg, ltrb=self.opt.ltrb, K=self.opt.K)
             id_feature = _tranpose_and_gather_feat(id_feature, inds)
@@ -297,7 +295,7 @@ class JDETracker(object):
         #dists = matching.iou_distance(strack_pool, detections)
         dists = matching.fuse_motion(self.kalman_filter, dists, strack_pool, detections)
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=0.4)
-
+        
         for itracked, idet in matches:
             track = strack_pool[itracked]
             det = detections[idet]
@@ -308,11 +306,60 @@ class JDETracker(object):
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
-        ''' Step 3: Second association, with IOU'''
-        detections = [detections[i] for i in u_detection]
+        
+
+        # if len(r_tracked_stracks):
+        #     fig, ax = plt.subplots(1,1,figsize=(20,12))
+        #     fig.tight_layout()
+        #     ax.imshow(img0)
+        #     ax.axis('off')
+        #     for bb in bbs:
+        #         if bb[2]*bb[3] > 15:
+        #             rectangle = Rectangle((bb[0], bb[1]), bb[2], bb[3],fill=False, edgecolor=(1,0,0))
+        #             ax.add_patch(rectangle)
+        #     for track in r_tracked_stracks:
+        #         bb = track.tlwh
+        #         rectangle = Rectangle((bb[0], bb[1]), bb[2], bb[3],fill=False, edgecolor=(0,0,1))
+        #         ax.add_patch(rectangle)
+
+        #     plt.savefig('temp.png')
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
+        use_kps = True
+        detections = [detections[i] for i in u_detection]
+
+        if use_kps:
+            bbs = self.fois_detector[self.frame_id]
+            if bbs.size:
+                kps = [STrack(bb, 1, 2, 30) for bb in bbs if bb[2]*bb[3]>15]
+                dists_kp = matching.iou_distance(r_tracked_stracks, kps)
+                matches, u_track, _ = matching.linear_assignment(dists_kp, thresh=0.4)
+                for itracked, idet in matches:
+                    track = r_tracked_stracks[itracked]
+                    det = kps[idet]
+                    if track.state == TrackState.Tracked:
+                        track.update(det, self.frame_id, update_feature=False)
+                        activated_starcks.append(track)
+                    else:
+                        track.re_activate(det, self.frame_id, new_id=False)
+                        refind_stracks.append(track)
+            if len(matches):
+                kps = np.array(kps)
+                kps = kps[matches[:,1]]
+                dists_kp = matching.iou_distance(detections, kps)
+                matches, _, _ = matching.linear_assignment(dists_kp, thresh=0.6)
+                matches = matches[:,0] if len(matches)  else []
+                unmatched_detections = list(set(np.arange(0,len(detections))) - set(matches))
+                
+                detections = [detections[d] for d in unmatched_detections]
+
+            ''' Step 3: Second association, with IOU'''
+        r_tracked_stracks = [r_tracked_stracks[i] for i in u_track if r_tracked_stracks[i].state == TrackState.Tracked]
+        # r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
+
         dists = matching.iou_distance(r_tracked_stracks, detections)
+
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=0.5)
+        # matches, u_track, u_detection = matching.linear_assignment(dists, thresh=0.5)
 
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
