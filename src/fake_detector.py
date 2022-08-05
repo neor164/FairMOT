@@ -1,22 +1,24 @@
 import json
-from typing import Tuple, List
+from typing import Optional, Tuple, List
 import numpy as np
 import random
+import cv2
 
-def get_boundingbox_kp(kp:np.ndarray)->List[int]:
+def get_boundingbox_kp(kp:np.ndarray)->Optional[List[int]]:
     vis_kp = kp[kp[:,2] == 2]
     if vis_kp.size:
         min_x,min_y, _ = vis_kp.min(axis=0)
         max_x,max_y, _ = vis_kp.max(axis=0)
-
+        nkps = vis_kp.shape[0]
     # np.mean(kp[kp[:,2] == 1],axis=0)
 
-        return [min_x, min_y, max_x - min_x, max_y - min_y]
-
+        return [min_x, min_y, max_x - min_x, max_y - min_y, nkps]
+   
 class MotSynthDetector:
-    def __init__(self,ann_path:str, alpha:float=1.75) -> None:
+    def __init__(self,ann_path:str,opt, alpha:float=1.75) -> None:
         self.alpha = alpha
         self.ann_path = ann_path
+        self.opt = opt
         with open(self.ann_path, 'r' ) as w:
             data = json.loads(w.read())
             self.annotations = np.array(data['annotations'])
@@ -40,15 +42,21 @@ class MotSynthDetector:
         #         if random.random() <= likelihood:
         #             out_inds.extend(ind)
         anns = self.annotations[inds]
-        bbs = np.empty((0, 4))
-
+        bbs = np.empty((0, 5))
+        vkps = [] 
         for ann in anns:
-            bb = get_boundingbox_kp(np.array(ann[0]['keypoints']).reshape(22,3))
-            if bb:
+            kps = np.array(ann[0]['keypoints']).reshape(22,3).astype(float)
+            bb = get_boundingbox_kp(kps)
+
+            if bb :
+                if bb[4] == 1:
+                    bb[2] = 4
+                    bb[3] = 4
                 bb = np.array([bb])
                 bbs = np.concatenate((bbs,bb),axis=0)
+                vkps.append(kps)
 
-        return bbs
+        return bbs, vkps
         
 
     def get_frame_path(self, frame_id:int):
@@ -62,3 +70,9 @@ class MotSynthDetector:
     def __getitem__(self, frame_id:int)->np.ndarray:
         return self.get_bbs_by_frame(frame_id)
 
+    @staticmethod
+    def draw_keypoints(frame:np.ndarray, keypoints:np.ndarray,color=(255, 0, 255)):
+        for row_indx in range(keypoints.shape[0]):
+            x, y, vis = keypoints[row_indx, :]
+            if vis == 2:
+                frame = cv2.circle(frame, (int(x),int(y)), radius=3, color=color, thickness=-1)
