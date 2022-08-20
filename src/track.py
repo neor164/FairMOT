@@ -2,6 +2,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 from cProfile import label
+import json
 from typing import Dict, Union
 
 import _init_paths
@@ -121,69 +122,48 @@ def eval_seq(opt, dataloader, data_type, result_filename, save_dir=None, show_im
     # save results
     write_results(result_filename, results, data_type)
     #write_results_score(result_filename, results, data_type)
-    frame_ids = list(tracker.kalman_data['predict'].keys())
-    min_frame = np.min(frame_ids)
-    max_frame = np.max(frame_ids)
-    pred_x = np.full([len(frame_ids)], np.nan)
-    update_x =  np.full([len(frame_ids)], np.nan)
-    detection_x = np.full([len(frame_ids)], np.nan)
-    has_detection = np.full([len(frame_ids)], np.nan)
-    no_detection = np.full([len(frame_ids)], np.nan)
-    iou_x = np.full([len(frame_ids)], np.nan)
-    keypoints_x = np.full([len(frame_ids)], np.nan)
-    covariance_x = np.full([len(frame_ids)], np.nan)
+    # frame_ids = list(tracker.kalman_data['predict'].keys())
+    # min_frame = np.min(frame_ids)
+    # max_frame = np.max(frame_ids)
+    # pred_x = np.full([len(frame_ids)], np.nan)
+    # update_x =  np.full([len(frame_ids)], np.nan)
+    # detection_x = np.full([len(frame_ids)], np.nan)
+    # has_detection = np.full([len(frame_ids)], np.nan)
+    # no_detection = np.full([len(frame_ids)], np.nan)
+    # iou_x = np.full([len(frame_ids)], np.nan)
+    # keypoints_x = np.full([len(frame_ids)], np.nan)
+    # covariance_x = np.full([len(frame_ids)], np.nan)
 
-    gt_x = np.full([len(frame_ids)], np.nan)
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(1,2, figsize=(28,14))
-    # fig.tight_layout()
-    for idx, fid in enumerate(frame_ids):
-        pred_x[idx] = tracker.kalman_data['predict'][fid][0]
-    min_frame = np.min(list(tracker.kalman_data['update'].keys()))    
-    for key, value in tracker.kalman_data['update'].items():
+    # gt_x = np.full([len(frame_ids)], np.nan)
+    # import matplotlib.pyplot as plt
+    # fig, ax = plt.subplots(1,2, figsize=(28,14))
+    # # fig.tight_layout()
+    # for idx, fid in enumerate(frame_ids):
+    #     pred_x[idx] = tracker.kalman_data['predict'][fid][0]
+    # min_frame = np.min(list(tracker.kalman_data['update'].keys()))    
+    # for key, value in tracker.kalman_data['update'].items():
         
-        idx =  key - min_frame
-        update_type =  tracker.kalman_data['update_type'].get(key, None)
-        # if update_type.lower() == 'fairmot':
-        #     fairmot_x[idx] = tracker.kalman_data['update'][key][0]
-        # elif update_type.lower() == 'iou':
-        #     iou_x[idx] = tracker.kalman_data['update'][key][0]
-        # else:  
-        if len(detection_x) > idx:       
-            detection_x[idx] = tracker.kalman_data['detection'].get(key, np.nan)
-        if len(update_x) > idx: 
-            update_x[idx] = tracker.kalman_data['update'].get(key, np.nan)[0]
-            covariance_x[idx] = tracker.kalman_data['covariance_error'].get(key, np.nan)
-    min_frame = np.min(list(tracker.kalman_data['gt'].keys()))     
-    for key, value in tracker.kalman_data['gt'].items():
-        idx =  key - min_frame
-        if len(gt_x) > idx: 
-            gt_x[idx] = tracker.kalman_data['gt'].get(key, np.nan)
+    #     idx =  key - min_frame
+    #     update_type =  tracker.kalman_data['update_type'].get(key, None)
+    #     # if update_type.lower() == 'fairmot':
+    #     #     fairmot_x[idx] = tracker.kalman_data['update'][key][0]
+    #     # elif update_type.lower() == 'iou':
+    #     #     iou_x[idx] = tracker.kalman_data['update'][key][0]
+    #     # else:  
+    #     if len(detection_x) > idx:       
+    #         detection_x[idx] = tracker.kalman_data['detection'].get(key, np.nan)
+    #     if len(update_x) > idx: 
+    #         update_x[idx] = tracker.kalman_data['update'].get(key, np.nan)[0]
+    #         covariance_x[idx] = tracker.kalman_data['covariance_error'].get(key, np.nan)
+    # min_frame = np.min(list(tracker.kalman_data['gt'].keys()))     
+    # for key, value in tracker.kalman_data['gt'].items():
+    #     idx =  key - min_frame
+    #     if len(gt_x) > idx: 
+    #         gt_x[idx] = tracker.kalman_data['gt'].get(key, np.nan)
 
-    ax[0].plot(frame_ids,pred_x, label='prediction', color='b')
-    ax[0].plot(frame_ids,gt_x, label='gt', color='r')
-    ax[0].plot(frame_ids,update_x, label=' update', color='c')
-    # ax.plot(frame_ids,detection_x, label='detection update', color='g')
-    ax[0].plot(frame_ids, detection_x,color='g',label='measurment')
-    ax[0].scatter(frame_ids, np.where(np.isnan(detection_x), gt_x, np.nan), 15 ,'r',label='mis-detected')
-    ax[0].set_title('kalman states ',fontsize='x-large')
+    data = {'frame_data':tracker.scenario_data,'matching_data':tracker.matching_data}
 
-    # ax.plot(frame_ids,value_x, label='value', color='y')
-    ax[0].set_xlabel('frame ids',fontsize='x-large')
-    ax[0].set_ylabel('x values in pixels',fontsize='x-large')
-    ax[0].legend()
-    ax[1].plot(frame_ids,update_x - gt_x, label='correction', color='b')
-    ax[1].plot(np.sqrt(covariance_x), label='covariance error +', color='k')
-    ax[1].plot(-np.sqrt(covariance_x), label='covariance error -', color='k')
-    ax[1].legend()
-
-    ax[1].set_xlabel('frame ids',fontsize='x-large')
-    ax[1].set_ylabel('correction error x in pixels',fontsize='x-large')
-    ax[1].set_title('correction ',fontsize='x-large')
-    title = 'Orginal Kalman' if not opt.use_kp else 'With keypoints'
-    fig.suptitle(title)
-    plt.savefig(f'{title}.png')
-    return frame_id, timer.average_time, timer.calls
+    return frame_id, timer.average_time, timer.calls, data
 
 
 def main(opt, data_root='/data', det_root=None, seqs=('MOT16-05',), exp_name='demo',
@@ -200,8 +180,11 @@ def main(opt, data_root='/data', det_root=None, seqs=('MOT16-05',), exp_name='de
     n_frame = 0
     timer_avgs, timer_calls = [], []
     for seq in seqs:
+        annotations_path = os.path.join(data_root, seq)
         opt.kp_data = '/data/kp_data'
-        opt.gt = pd.read_csv('/data/MOTSynth/033/gt/gt.txt',header=None)
+
+        opt.gt = pd.read_csv('/data/MOTSynth/033/gt/gt.txt',names=['frame_id', 'target_id', 'x', 'y', 'w', 'h', 'y_pred', 'x_pred', 'vis', 'w_pred'],header=None, index_col=False)
+        opt.gt['matched_tracker'] = None
         output_dir = os.path.join(data_root, '..', 'outputs', exp_name, seq) if save_images or save_videos else None
         logger.info('start seq: {}'.format(seq))
         if opt.mot_synth:
@@ -212,13 +195,12 @@ def main(opt, data_root='/data', det_root=None, seqs=('MOT16-05',), exp_name='de
             opt.fois_detector = fois_detector
         else:
             data_path = osp.join(data_root, seq, 'img1')
-        annotations_path = os.path.join(data_root, seq)
         dataloader = datasets.LoadImages(data_path, opt.img_size)
         result_filename = os.path.join(result_root, '{}.txt'.format(seq))
         
         meta_info = open(os.path.join(annotations_path, 'seqinfo.ini')).read()
         frame_rate = int(meta_info[meta_info.find('frameRate') + 10:meta_info.find('\nseqLength')])
-        nf, ta, tc = eval_seq(opt, dataloader, data_type, result_filename,
+        nf, ta, tc,data = eval_seq(opt, dataloader, data_type, result_filename,
                               save_dir=output_dir, show_image=show_image, frame_rate=frame_rate)
         n_frame += nf
         timer_avgs.append(ta)
@@ -245,6 +227,10 @@ def main(opt, data_root='/data', det_root=None, seqs=('MOT16-05',), exp_name='de
     all_time = np.dot(timer_avgs, timer_calls)
     avg_time = all_time / np.sum(timer_calls)
     logger.info('Time elapsed: {:.2f} seconds, FPS: {:.2f}'.format(all_time, 1.0 / avg_time))
+    res_name = f'{seq}_results' if opt.use_kp else  f'{seq}_results_wo_kps'
+    opt.gt.to_csv(res_name + '.csv')
+    with open(res_name +'.json', 'w') as jf:
+            json.dump(data, jf)
 
     # get summary
     metrics = mm.metrics.motchallenge_metrics
@@ -367,7 +353,7 @@ if __name__ == '__main__':
          exp_name='MOTSynth',
          show_image=False,
          save_images=False,
-         save_videos=True)
+         save_videos=False)
     os.system('rm -r /data/results/*')
     # os.system('mv data/results/MOTSynth/* /data/results/')
     # os.system('mv /data/outputs/MOTSynth/*/*.mp4 /data/results/')

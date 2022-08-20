@@ -1,8 +1,12 @@
+from ast import Str
+from copy import deepcopy
 import itertools
 import os
 import os.path as osp
+from re import T
 import time
 from collections import deque
+from typing import Dict, Optional, Union
 
 import cv2
 import numpy as np
@@ -19,27 +23,29 @@ from utils.image import get_affine_transform
 from utils.post_process import ctdet_post_process
 from matplotlib.patches import Rectangle
 from tracker import matching
-
+import tracker.tracker_data as td 
 from .basetrack import BaseTrack, TrackState
-
+import pandas as pd
 
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
-    def __init__(self, tlwh, score, temp_feat, buffer_size=30):
+    def __init__(self, tlwh, score, temp_feat, buffer_size=30, key_points:Optional[np.ndarray]=None, det_id:int=0):
 
         # wait activate
         self._tlwh = np.asarray(tlwh, dtype=np.float)
         self.kalman_filter = None
         self.mean, self.covariance = None, None
         self.is_activated = False
-
+        self.det_id = det_id
         self.score = score
         self.tracklet_len = 0
-
         self.smooth_feat = None
         self.update_features(temp_feat)
         self.features = deque([], maxlen=buffer_size)
         self.alpha = 0.9
+        self.key_points = key_points
+        self.prev_bb = tlwh
+
 
     def update_features(self, feat):
         feat /= np.linalg.norm(feat)
@@ -58,7 +64,7 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.predict(mean_state, self.covariance)
 
     @staticmethod
-    def multi_predict(stracks):
+    def multi_predict(stracks, kalman_data=None):
         if len(stracks) > 0:
             multi_mean = np.asarray([st.mean.copy() for st in stracks])
             multi_covariance = np.asarray([st.covariance for st in stracks])
@@ -69,6 +75,12 @@ class STrack(BaseTrack):
             for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
                 stracks[i].mean = mean
                 stracks[i].covariance = cov
+                if kalman_data and stracks[i].track_id == kalman_data['tracker_id']:
+                    kalman_data['predict'][stracks[i].frame_id] = stracks[i].tlwh
+                diff = stracks[i].tlwh[:2] - stracks[i].prev_bb[:2]
+                stracks[i].prev_bb = stracks[i].tlwh
+                if  stracks[i].key_points is not None:
+                    stracks[i].key_points[:, :2] += diff
 
     def activate(self, kalman_filter, frame_id):
         """Start a new tracklet"""
@@ -97,7 +109,7 @@ class STrack(BaseTrack):
         if new_id:
             self.track_id = self.next_id()
 
-    def update(self, new_track, frame_id, update_feature=True):
+    def update(self, new_track, frame_id, update_feature=True, update_weight=1.0,kalman_data=None,update_type='fairmot'):
         """
         Update a matched track
         :type new_track: STrack
@@ -109,14 +121,23 @@ class STrack(BaseTrack):
         self.tracklet_len += 1
 
         new_tlwh = new_track.tlwh
+       
         self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_tlwh))
+            self.mean, self.covariance, self.tlwh_to_xyah(new_tlwh),update_weight)
         self.state = TrackState.Tracked
         self.is_activated = True
-
+        self.key_points = new_track.key_points
+        if kalman_data is not None and self.track_id == kalman_data['tracker_id']:
+            kalman_data['update'][frame_id] = self.tlwh
+            kalman_data['covariance_error'][frame_id] = self.covariance[0,0]
+            kalman_data['detection'][frame_id] = new_track.tlwh[0]
+            # kalman_data['value'][frame_id] =  self.tlwh_to_xyah(new_tlwh)
+            kalman_data['update_type'][frame_id] = update_type
         self.score = new_track.score
         if update_feature:
             self.update_features(new_track.curr_feat)
+        self.prev_bb = self.tlwh
+
 
     @property
     def tlwh(self):
@@ -176,6 +197,20 @@ class JDETracker(object):
         else:
             opt.device = torch.device('cpu')
         print('Creating model...')
+        self.kalman_data: Dict[str,Dict[int, Union[np.ndarray, str]]] = {
+        'predict':{},
+        'update':{},
+        'detection':{},
+        'update_type':{},
+        'gt':{},
+        'tracker_id':None,
+        'covariance_error':{}
+
+        }
+        self.scenario_data = {}
+        self.matching_data = {}
+        self.matched_target_id = False
+        self.start_frame_target_id = opt.gt.loc[opt.gt['target_id'] == opt.tracker_id]['frame_id'].min()
         self.model = create_model(opt.arch, opt.heads, opt.head_conv)
         self.model = load_model(self.model, opt.load_model)
         self.model = self.model.to(opt.device)
@@ -192,7 +227,7 @@ class JDETracker(object):
         self.max_per_image = opt.K
         self.mean = np.array(opt.mean, dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array(opt.std, dtype=np.float32).reshape(1, 1, 3)
-
+        
         self.kalman_filter = KalmanFilter()
 
     def post_process(self, dets, meta):
@@ -222,7 +257,10 @@ class JDETracker(object):
         return results
 
     def update(self, im_blob, img0):
+        frame = deepcopy(img0)
         self.frame_id += 1
+        self.scenario_data[self.frame_id+1] = {'detections':[], 'ground_truth':{}, 'trackers':{}, 'keypoints':[]}
+
         activated_starcks = []
         refind_stracks = []
         lost_stracks = []
@@ -236,7 +274,10 @@ class JDETracker(object):
         meta = {'c': c, 's': s,
                 'out_height': inp_height // self.opt.down_ratio,
                 'out_width': inp_width // self.opt.down_ratio}
-
+        text_scale = max(1, frame.shape[1] / 1600.)
+        text_thickness = 2
+        frame =  cv2.putText(frame, str(self.frame_id), (10, 10), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 0, 255),
+                                    thickness=text_thickness) 
         ''' Step 1: Network forward, get detections & embeddings'''
         with torch.no_grad():
             output = self.model(im_blob)[-1]
@@ -271,11 +312,13 @@ class JDETracker(object):
 
         if len(dets) > 0:
             '''Detections'''
-            detections = [STrack(STrack.tlbr_to_tlwh(tlbrs[:4]), tlbrs[4], f, 30) for
-                          (tlbrs, f) in zip(dets[:, :5], id_feature)]
+            detections = [STrack(STrack.tlbr_to_tlwh(tlbrs[:4]), tlbrs[4], f, 30,det_id=idx) for
+                          (idx,(tlbrs, f)) in enumerate(zip(dets[:, :5], id_feature))]
+            
         else:
             detections = []
 
+        self.scenario_data[self.frame_id+1]['detections']  = [td.DetectionsData(bounding_box=f.tlwh.tolist(), confidance=f.score).dict() for f in detections] 
         ''' Add newly detected tracklets to tracked_stracks'''
         unconfirmed = []
         tracked_stracks = []  # type: list[STrack]
@@ -284,29 +327,59 @@ class JDETracker(object):
                 unconfirmed.append(track)
             else:
                 tracked_stracks.append(track)
+        if self.opt.use_kp:
+            bbs, vkps = self.fois_detector[self.frame_id]
+            for v in vkps:
+                self.scenario_data[self.frame_id+1]['keypoints'].append(td.KeypointsData(keypoints=v.tolist()).dict())
+            if bbs.size:
+                track_bbs = [STrack(bb[:4], 1, 2, 30) for bb in bbs]
+                dists_kp = matching.iou_distance(track_bbs, detections)
+                matches, u_track, _ = matching.linear_assignment(dists_kp, thresh=0.9)
+                for itracked, idet in matches:
+                   detections[idet].key_points =  vkps[itracked]
+                   self.scenario_data[self.frame_id+1]['keypoints'][itracked]['matched_with_detection']= True
+                   self.scenario_data[self.frame_id+1]['detections'][idet]['keypoints'] = detections[idet].key_points.tolist()
+                unmatches_keypoints = [vkps[ut] for ut in  u_track]   
+                
+
 
         ''' Step 2: First association, with embedding'''
         strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
         # Predict the current location with KF
         #for strack in strack_pool:
             #strack.predict()
-        STrack.multi_predict(strack_pool)
+        STrack.multi_predict(strack_pool, self.kalman_data)
         dists = matching.embedding_distance(strack_pool, detections)
         #dists = matching.iou_distance(strack_pool, detections)
         dists = matching.fuse_motion(self.kalman_filter, dists, strack_pool, detections)
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=0.4)
-        
+
+
+
         for itracked, idet in matches:
             track = strack_pool[itracked]
             det = detections[idet]
             if track.state == TrackState.Tracked:
-                track.update(detections[idet], self.frame_id)
+                track.update(detections[idet], self.frame_id,kalman_data=self.kalman_data,update_type='fairmot')
                 activated_starcks.append(track)
+                bbox = track.tlwh
+                self.scenario_data[self.frame_id+1]['detections'][det.det_id]['matched_with_tracker'] = True
+                frame = cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])),
+                    (int(bbox[2] + bbox[0]), int(bbox[3]+bbox[1])),
+                    (255, 0, 0), 2)
+                text_scale = max(1, frame.shape[1] / 1600.)
+                text_thickness = 2
+                tid = str(int(track.track_id))
+                frame =  cv2.putText(frame, tid, (int(bbox[0]-20), int(bbox[1] + 30)), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 255, 255),
+                                    thickness=text_thickness)  
+                # frame =  cv2.putText(frame, iou_text, (int(bbox[0]), int(bbox[1] + 30)), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 0, 255),
+                #             thickness=text_thickness)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
-        
+
+
 
         # if len(r_tracked_stracks):
         #     fig, ax = plt.subplots(1,1,figsize=(20,12))
@@ -324,37 +397,11 @@ class JDETracker(object):
 
         #     plt.savefig('temp.png')
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
-        use_kps = True
-        detections = [detections[i] for i in u_detection]
+       
 
-        if use_kps:
-            bbs = self.fois_detector[self.frame_id]
-            if bbs.size:
-                kps = [STrack(bb, 1, 2, 30) for bb in bbs if bb[2]*bb[3]>15]
-                dists_kp = matching.iou_distance(r_tracked_stracks, kps)
-                matches, u_track, _ = matching.linear_assignment(dists_kp, thresh=0.4)
-                for itracked, idet in matches:
-                    track = r_tracked_stracks[itracked]
-                    det = kps[idet]
-                    if track.state == TrackState.Tracked:
-                        track.update(det, self.frame_id, update_feature=False)
-                        activated_starcks.append(track)
-                    else:
-                        track.re_activate(det, self.frame_id, new_id=False)
-                        refind_stracks.append(track)
-            if len(matches):
-                kps = np.array(kps)
-                kps = kps[matches[:,1]]
-                dists_kp = matching.iou_distance(detections, kps)
-                matches, _, _ = matching.linear_assignment(dists_kp, thresh=0.6)
-                matches = matches[:,0] if len(matches)  else []
-                unmatched_detections = list(set(np.arange(0,len(detections))) - set(matches))
-                
-                detections = [detections[d] for d in unmatched_detections]
-
-            ''' Step 3: Second association, with IOU'''
-        r_tracked_stracks = [r_tracked_stracks[i] for i in u_track if r_tracked_stracks[i].state == TrackState.Tracked]
+        ''' Step 3: Second association, with IOU'''
         # r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
+        detections = [detections[i] for i in u_detection]
 
         dists = matching.iou_distance(r_tracked_stracks, detections)
 
@@ -365,17 +412,94 @@ class JDETracker(object):
             track = r_tracked_stracks[itracked]
             det = detections[idet]
             if track.state == TrackState.Tracked:
-                track.update(det, self.frame_id)
+                track.update(det, self.frame_id,kalman_data=self.kalman_data,update_type='IoU')
                 activated_starcks.append(track)
+                bbox = track.tlwh
+                frame = cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])),
+                    (int(bbox[2] + bbox[0]), int(bbox[3]+bbox[1])),
+                    (255, 0, 0), 2)
+                text_scale = max(1, frame.shape[1] / 1600.)
+                text_thickness = 2
+                tid = str(int(track.track_id))
+                frame =  cv2.putText(frame, tid, (int(bbox[0]-20), int(bbox[1] + 30)), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 255, 255),
+                                    thickness=text_thickness)  
+                # frame =  cv2.putText(frame, iou_text, (int(bbox[0]
+                self.scenario_data[self.frame_id+1]['detections'][det.det_id]['matched_with_tracker'] = True
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
+
+
+        
+        if self.opt.use_kp:
+           r_tracked_stracks = [r_tracked_stracks[i] for i in u_track if r_tracked_stracks[i].state == TrackState.Tracked]
+           N = len(unmatches_keypoints)
+           M = len(r_tracked_stracks)
+           if N >0 and M>0:
+            euc_dist = 4*np.ones([N,M])
+            for n in range(N):
+                for m in range(M):
+                    ukps = unmatches_keypoints[n][:,:2]
+                    track = r_tracked_stracks[m]
+                    if track.key_points is not None:
+                        rkps = track.key_points[:,:2]
+                        diff = ukps - rkps
+                        dist = np.sqrt(np.sum(( diff )**2,axis=1))
+                        vis = np.argwhere( (unmatches_keypoints[n][:,2] ==2) & (track.key_points[:,2] ==2))
+                        if len(vis) > 0:
+
+                            diag = np.sqrt(track.tlwh[2]**2 + track.tlwh[3]**2) * (self.frame_id - track.frame_id)
+                            edist = np.sum(dist[vis])/(len(vis)*diag)
+                            euc_dist[n,m] = edist
+
+            matches, u_keypoints, u_track = matching.linear_assignment(euc_dist, thresh=0.1)
+            for idet, itracked in matches:
+                
+                track = r_tracked_stracks[itracked]
+
+                ukps = unmatches_keypoints[idet][:,:2]
+                rkps = r_tracked_stracks[itracked].key_points[:,:2]
+                diff = ukps - rkps
+                unvis = np.argwhere( (unmatches_keypoints[idet][:,2] ==2) | (r_tracked_stracks[itracked].key_points[:,2] ==2))
+                n_vis = len(unvis)
+                mdiff = np.mean(diff[unvis],axis=0)
+                new_bb = deepcopy(track.prev_bb)
+                new_bb[:2] += mdiff.flatten()
+                new_track = STrack(new_bb, n_vis * self.opt.nkps_to_confidance, 2, 30,key_points=unmatches_keypoints[idet])
+                track.update(new_track, self.frame_id,update_feature=False,kalman_data=self.kalman_data,update_type='keypoints',update_weight=new_track.score)
+                bbox = track.tlwh
+                frame = cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])),
+                    (int(bbox[2] + bbox[0]), int(bbox[3]+bbox[1])),
+                    (0, 255, 0), 2)
+                text_scale = max(1, frame.shape[1] / 1600.)
+                text_thickness = 2
+                euc_dist_text = str(round(euc_dist[ idet,itracked],2))
+                frame =  cv2.putText(frame, euc_dist_text, (int(bbox[0]), int(bbox[1] + 30)), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 0, 255),
+                            thickness=text_thickness)
+                tid = str(int(track.track_id))
+                frame =  cv2.putText(frame, tid, (int(bbox[0]-20), int(bbox[1] + 30)), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 255, 255),
+                            thickness=text_thickness) 
+                self.fois_detector.draw_keypoints(frame, unmatches_keypoints[idet],color=[0,255,0])
+                activated_starcks.append(track)
+
+            for  idet in u_keypoints:
+
+                self.fois_detector.draw_keypoints(frame, unmatches_keypoints[idet])
+       
+
+                        
         for it in u_track:
             track = r_tracked_stracks[it]
+            # bbox = track.tlwh
+
+            # frame = cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])),
+            #             (int(bbox[2]+bbox[0]), int(bbox[3]+bbox[1])),
+            #             (0, 255, 255), 2) 
             if not track.state == TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
+
 
         '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
         detections = [detections[i] for i in u_detection]
@@ -384,11 +508,13 @@ class JDETracker(object):
         for itracked, idet in matches:
             unconfirmed[itracked].update(detections[idet], self.frame_id)
             activated_starcks.append(unconfirmed[itracked])
+            
         for it in u_unconfirmed:
             track = unconfirmed[it]
             track.mark_removed()
             removed_stracks.append(track)
 
+        
         """ Step 4: Init new stracks"""
         for inew in u_detection:
             track = detections[inew]
@@ -396,12 +522,61 @@ class JDETracker(object):
                 continue
             track.activate(self.kalman_filter, self.frame_id)
             activated_starcks.append(track)
+        ## match with gt
+        # gt_row  = self.opt.gt.loc[(self.opt.gt[0]== self.frame_id) & (self.opt.gt[1]== self.opt.tracker_id)]
+        # if len(gt_row):
+        #     gt_bb = [int(gt_row[2]), int(gt_row[3]),int(gt_row[4]), int(gt_row[5])]
+        #     gt_t = STrack(gt_bb, 1, 1, 30)
+        # if not self.matched_target_id and self.start_frame_target_id <= self.frame_id and  len(gt_row):
+
+        #         dists = matching.iou_distance(activated_starcks,[gt_t])
+        #         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=0.2)
+        #         for itracked, idet in matches:
+        #             self.matched_target_id = True
+        #             self.kalman_data['tracker_id'] = activated_starcks[itracked].track_id
+
+
+        # if self.matched_target_id and len(gt_row):
+        #     self.kalman_data['gt'][self.frame_id] = gt_bb[0]
+            # frame = cv2.rectangle(frame, (int(gt_bb[0]), int(gt_bb[1])),
+            #             (int(gt_bb[2]+gt_bb[0]), int(gt_bb[3]+gt_bb[1])),
+            #             (0, 255, 0), 2)
+            # for tracker in activated_starcks:
+            #     if self.kalman_data['tracker_id'] == tracker.track_id:
+            #         bbox = tracker.tlwh
+            #         # bbox = track.tlwh
+            #         if tracker.end_frame < self.frame_id:
+            #             color = [0,255,255]
+            #         else:
+            #             color = [0,0,255]
+            #         # frame = cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])),
+            #         #             (int(bbox[2]+bbox[0]), int(bbox[3]+bbox[1])),
+            #         #             color, 2) 
+           
+
+
         """ Step 5: Update state"""
+        pred_tracks = []
         for track in self.lost_stracks:
+            bbox = track.tlwh
+
+
             if self.frame_id - track.end_frame > self.max_time_lost:
                 track.mark_removed()
                 removed_stracks.append(track)
-
+                frame = cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])),
+                        (int(bbox[2]+bbox[0]), int(bbox[3]+bbox[1])),
+                        (0, 100, 255), 2) 
+                if track.key_points is not None:
+                    self.fois_detector.draw_keypoints(frame, track.key_points, color= [0,100,255])
+                
+            else:
+                frame = cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])),
+                        (int(bbox[2]+bbox[0]), int(bbox[3]+bbox[1])),
+                        (0, 255, 255), 2) 
+                if track.key_points is not None:
+                    self.fois_detector.draw_keypoints(frame, track.key_points, color= [0,255,255])
+                pred_tracks.append(track)
         # print('Ramained match {} s'.format(t4-t3))
 
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
@@ -414,13 +589,43 @@ class JDETracker(object):
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
         # get scores of lost tracks
         output_stracks = [track for track in self.tracked_stracks if track.is_activated]
+        eval_tracks = deepcopy(output_stracks)
+        eval_tracks.extend(pred_tracks)
+        for track in eval_tracks:
+            self.scenario_data[self.frame_id + 1]['trackers'][track.track_id] = td.TrackerData(id=track.track_id,bounding_box=track.tlwh.tolist(), updated=True if track.frame_id == self.frame_id else False).dict()
+            if isinstance(track.key_points, np.ndarray):
+                self.scenario_data[self.frame_id+ 1]['trackers'][track.track_id]['keypoints'] = track.key_points.tolist()
 
+        gt_df:pd.Dataframe  = self.opt.gt.loc[(self.opt.gt['frame_id']== self.frame_id + 1)& (self.opt.gt['vis']>0)]
+        gts = []
+        for idx, gt_row in gt_df.iterrows():
+
+            if len(gt_row):
+                gt_bb = [int(gt_row[2]), int(gt_row[3]),int(gt_row[4]), int(gt_row[5])]
+                gts.append(STrack(gt_bb, 1, 1, 30,det_id=gt_row[1]))
+                self.scenario_data[self.frame_id+ 1]['ground_truth'][int(gt_row[1])] = td.GroundTruthData(id=int(gt_row[1]), bounding_box=gt_bb).dict() 
+
+        dists = matching.iou_distance(eval_tracks, gts)
+        matches, u_track, u_detection = matching.linear_assignment(dists, thresh=0.5)
+        
+        for itracked, idet in matches:
+            track:STrack = eval_tracks[itracked]
+            gtid = gt_df.iloc[idet]['target_id']
+            self.scenario_data[self.frame_id+1]['trackers'][track.track_id]['matched_with_gt'] = int(gtid)
+            self.scenario_data[self.frame_id+1]['ground_truth'][gtid]['matched_with_tracker'] = int(track.track_id)
+            if track.tracklet_len == 0:
+                if not track.track_id in self.matching_data:
+                    self.matching_data[track.track_id] = {}
+                self.matching_data[track.track_id]['gt'] = int(gtid)
+            idx = self.opt.gt.loc[(self.opt.gt['frame_id']==self.frame_id + 1) & (self.opt.gt['target_id'] == gtid )].index    
+            self.opt.gt.at[idx, 'matched_tracker'] = int(track.track_id)
+    
         logger.debug('===========Frame {}=========='.format(self.frame_id))
         logger.debug('Activated: {}'.format([track.track_id for track in activated_starcks]))
         logger.debug('Refind: {}'.format([track.track_id for track in refind_stracks]))
         logger.debug('Lost: {}'.format([track.track_id for track in lost_stracks]))
         logger.debug('Removed: {}'.format([track.track_id for track in removed_stracks]))
-
+        cv2.imwrite(os.path.join(self.opt.kp_data, '{:05d}.jpg'.format(self.frame_id)), frame)
         return output_stracks
 
 

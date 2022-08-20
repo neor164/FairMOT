@@ -5,6 +5,7 @@ from __future__ import print_function
 import argparse
 import os
 import sys
+from tkinter import FALSE
 
 class opts(object):
   def __init__(self):
@@ -101,6 +102,11 @@ class opts(object):
     # tracking
     self.parser.add_argument('--test_mot16', default=False, help='test mot16')
     self.parser.add_argument('--mot_synth', default=False, help='mot_synth')
+    self.parser.add_argument('--use_kp', default=False, help='whether or not to use keypoint')
+    self.parser.add_argument('--kps_thersh', type=int, default=3, help='minimum number of keypoint needed for constructing a bounding box')
+    self.parser.add_argument('--tracker_id', type=int, default=7, help='minimum number of keypoint needed for constructing a bounding box')
+
+    self.parser.add_argument('--nkps_to_confidance', type=float, default=1/22 * 5, help='minimum number of keypoint needed for constructing a bounding box')
 
     self.parser.add_argument('--val_mot15', default=False, help='val mot15')
     self.parser.add_argument('--test_mot15', default=False, help='test mot15')
